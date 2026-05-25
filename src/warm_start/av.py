@@ -7,16 +7,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
 os.environ["WANDB_PROJECT"] = "lc0-nla"
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA = ROOT / "data/pretrain/shard-combined_teacher_tp4_encoder14_ln2_betas.jsonl"
+DEFAULT_DATA = (
+    ROOT / "data/pretrain/shard-combined_teacher_tp4_encoder14_ln2_betas.jsonl"
+)
 DEFAULT_MODEL = "Qwen/Qwen3-4B"
 DEFAULT_CACHE = "/scratch/hub"
 DEFAULT_ACTIVATION_DIM = 512
@@ -275,7 +276,9 @@ class ActivationVerbalizerCollator:
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         activations = torch.stack([feature["activation"] for feature in features])
-        max_prompt_len = max(feature["prompt_input_ids"].shape[0] for feature in features)
+        max_prompt_len = max(
+            feature["prompt_input_ids"].shape[0] for feature in features
+        )
         max_summary_len = max(
             feature["summary_input_ids"].shape[0] for feature in features
         )
@@ -292,7 +295,9 @@ class ActivationVerbalizerCollator:
 
             prompt_input_ids.append(
                 nn.functional.pad(
-                    feature["prompt_input_ids"], (0, prompt_pad), value=self.pad_token_id
+                    feature["prompt_input_ids"],
+                    (0, prompt_pad),
+                    value=self.pad_token_id,
                 )
             )
             prompt_attention_mask.append(
@@ -342,7 +347,7 @@ class AVTrainer(Trainer):
                     head_params.append(param)
                 else:
                     base_params.append(param)
-            self.optimizer = bnb.optim.AdamW8bit(
+            self.optimizer = torch.optim.AdamW(
                 [
                     {"params": base_params, "lr": self.args.learning_rate},
                     {"params": head_params, "lr": self.head_learning_rate},
@@ -360,6 +365,7 @@ class AVTrainer(Trainer):
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             unwrapped = self.accelerator.unwrap_model(self.model)
+            state_dict = {key: value.clone().cpu() for key, value in state_dict.items()}
 
             base_model_sd = {
                 key[6:]: value
@@ -382,7 +388,7 @@ class AVTrainer(Trainer):
                     "activation_token": ACTIVATION_TOKEN,
                     "activation_token_id": unwrapped.activation_token_id,
                 },
-                output_path / "av_head.pt",
+                output_path / "av_projector.pt",
             )
 
 
@@ -435,8 +441,8 @@ def build_model_and_tokenizer(
         args.model,
         cache_dir=args.cache_dir,
         dtype=torch.bfloat16 if args.bf16 else torch.float32,
-        device_map={"": local_rank},
         trust_remote_code=True,
+        device_map={"": local_rank},
     )
     base_model.resize_token_embeddings(len(tokenizer))
     base_model.config.pad_token_id = tokenizer.pad_token_id
@@ -492,13 +498,14 @@ def build_training_args(
         fsdp_config=fsdp_config,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="wandb",
-        run_name="lc0av",
+        run_name="avinitialization1",
     )
 
 
 def main() -> None:
     if "LOCAL_RANK" in os.environ:
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
     args = parse_args()
     if not args.data.exists():
         raise SystemExit(f"Data file not found: {args.data}")
@@ -507,6 +514,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     model, tokenizer = build_model_and_tokenizer(args)
+    model = model.to(f"cuda:{local_rank}")
     train_rows, eval_rows = build_rows_by_split(args)
     if not train_rows:
         raise SystemExit("No training rows found.")
@@ -547,9 +555,7 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        data_collator=ActivationVerbalizerCollator(
-            pad_token_id=tokenizer.pad_token_id
-        ),
+        data_collator=ActivationVerbalizerCollator(pad_token_id=tokenizer.pad_token_id),
         head_learning_rate=args.head_learning_rate,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
