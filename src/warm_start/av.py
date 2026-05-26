@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = (
     ROOT / "data/pretrain/shard-combined_teacher_tp4_encoder14_ln2_betas.jsonl"
 )
-DEFAULT_MODEL = "Qwen/Qwen3-4B"
+DEFAULT_MODEL = "Qwen/Qwen3.5-2B"
 DEFAULT_CACHE = "/scratch/hub"
 DEFAULT_ACTIVATION_DIM = 512
 DEFAULT_PREFIX_LEN = 64
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "outputs/warm_start/qwen3-4b-nla-av",
+        default=ROOT / "outputs/warm_start/qwen3.5-2b-nla-av",
     )
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--eval-split", default="val")
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fsdp-transformer-layer-cls-to-wrap",
-        default="Qwen3DecoderLayer",
+        default="Qwen3_5DecoderLayer",
     )
     parser.add_argument("--resume-from-checkpoint", default=None)
     return parser.parse_args()
