@@ -1,3 +1,5 @@
 data/
 lc0.onnx
 **/__pycache__/
+outputs/
+**/wandb/
