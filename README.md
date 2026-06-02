@@ -4,7 +4,7 @@ LC0 is among the best chess engines in the world. It's also pretty neural networ
 This repo tries to train a natural language autoencoder for it.
 
 ## The current plan
-- Create warm start data using Gemma4-31B (currently here)
-- Use this to distill a Qwen or some smaller 8B model that we can easily finetune
-- Train an NLA on LC0
+- Create warm start data using Gemma4-31B
+- Use this to distill a Qwen-3.5 2B model
+- Train an NLA on LC0 (currently here)
 - Get good at chess?
