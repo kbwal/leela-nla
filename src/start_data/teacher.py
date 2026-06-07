@@ -20,7 +20,7 @@ def build_teacher_prompt(
 ) -> str:
     board = chess.Board(fen)
     evidence = {
-        "fen": fen,
+        "board_state": format_board(board),
         "side_to_move": "white" if board.turn == chess.WHITE else "black",
         "legal_position": board.is_valid(),
         "eval": eval_info,
@@ -50,4 +50,8 @@ def build_teacher_prompt(
 
 def empty_teacher_summary() -> str:
     return ""
+
+
+def format_board(board: chess.Board) -> str:
+    return str(board)
 

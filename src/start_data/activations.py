@@ -10,6 +10,8 @@ from onnx2torch import convert
 
 from .schema import ActivationRef
 
+DEFAULT_PRETRAIN_LAYER = "encoder14/ln2/betas"
+
 
 PIECE_ORDER = [
     chess.PAWN,
@@ -24,7 +26,7 @@ PIECE_ORDER = [
 @dataclass(frozen=True)
 class ActivationConfig:
     onnx_path: Path = Path("/home/kushalb/leela-nla/lc0.onnx")
-    layer: str = "encoder0/mha/out/skip"
+    layer: str = DEFAULT_PRETRAIN_LAYER
     device: str = "cpu"
 
 

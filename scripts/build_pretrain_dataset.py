@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from start_data.activations import ActivationConfig, LeelaActivationExtractor
+from start_data.activations import DEFAULT_PRETRAIN_LAYER, ActivationConfig, LeelaActivationExtractor
 from start_data.lc0_uci import Lc0Config, Lc0Engine
 from start_data.positions import DEFAULT_LICHESS_URL, download_lichess_pgn, sample_positions
 from start_data.schema import PretrainRecord, position_id, split_for_id, write_jsonl
@@ -26,9 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--max-games", type=int, default=200)
     parser.add_argument("--out", type=Path, default=ROOT / "data/pretrain/shard-00000.jsonl")
-    parser.add_argument("--activation-dir", type=Path, default=ROOT / "data/pretrain/activations")
+    parser.add_argument(
+        "--activation-dir",
+        type=Path,
+        default=ROOT / "data/pretrain/activations_encoder14_ln2_betas",
+    )
     parser.add_argument("--onnx", type=Path, default=ROOT / "lc0.onnx")
-    parser.add_argument("--layer", default="encoder0/mha/out/skip")
+    parser.add_argument("--layer", default=DEFAULT_PRETRAIN_LAYER)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--skip-activations", action="store_true")
     parser.add_argument("--lc0", type=Path, default=Path("/home/kushalb/lc0/build/release/lc0"))

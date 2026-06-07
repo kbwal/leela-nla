@@ -14,8 +14,9 @@ import zstandard as zstd
 
 from .schema import PositionMetadata
 
-
-DEFAULT_LICHESS_URL = "https://database.lichess.org/standard/lichess_db_standard_rated_2013-01.pgn.zst"
+DEFAULT_LICHESS_URL = (
+    "https://database.lichess.org/standard/lichess_db_standard_rated_2013-01.pgn.zst"
+)
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,9 @@ class SampledPosition:
     metadata: PositionMetadata
 
 
-def download_lichess_pgn(url: str, output_path: Path, max_bytes: int | None = None) -> Path:
+def download_lichess_pgn(
+    url: str, output_path: Path, max_bytes: int | None = None
+) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=60) as response:
         response.raise_for_status()
@@ -45,7 +48,9 @@ def download_lichess_pgn(url: str, output_path: Path, max_bytes: int | None = No
 
 def open_pgn_text(path: Path) -> io.TextIOBase:
     if path.suffix == ".bz2":
-        return io.TextIOWrapper(bz2.open(path, "rb"), encoding="utf-8", errors="replace")
+        return io.TextIOWrapper(
+            bz2.open(path, "rb"), encoding="utf-8", errors="replace"
+        )
     if path.suffix == ".zst":
         compressed = path.open("rb")
         stream = zstd.ZstdDecompressor().stream_reader(compressed)
@@ -108,7 +113,36 @@ def sample_positions(
     pgn_path: Path,
     limit: int,
     max_games: int | None = None,
-    plies: Iterable[int] = (13, 21, 33, 49, 65),
+    plies: Iterable[int] = (
+        12,
+        13,
+        20,
+        21,
+        32,
+        33,
+        40,
+        41,
+        56,
+        57,
+        64,
+        65,
+        72,
+        73,
+        84,
+        85,
+        96,
+        97,
+        108,
+        109,
+        116,
+        117,
+        128,
+        129,
+        136,
+        137,
+        150,
+        151,
+    ),
     min_ply: int = 8,
     max_ply: int | None = 100,
 ) -> list[SampledPosition]:
@@ -130,4 +164,3 @@ def sample_positions(
             if len(sampled) >= limit:
                 return sampled
     return sampled
-
