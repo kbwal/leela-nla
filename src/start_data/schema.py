@@ -31,6 +31,19 @@ class ActivationRef:
 
 
 @dataclass(frozen=True)
+class PureActivationRecord:
+    id: str
+    fen: str
+    side_to_move: str
+    split: SplitName
+    metadata: PositionMetadata
+    activation: ActivationRef | None
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
+
+
+@dataclass(frozen=True)
 class PretrainRecord:
     id: str
     fen: str
@@ -64,6 +77,14 @@ def split_for_id(record_id: str, val_pct: int = 5, test_pct: int = 5) -> SplitNa
 
 
 def write_jsonl(path: Path, records: list[PretrainRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(record.to_json())
+            f.write("\n")
+
+
+def write_pure_activation_jsonl(path: Path, records: list[PureActivationRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for record in records:
