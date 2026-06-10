@@ -149,11 +149,6 @@ activation_token_id = av_tokenizer.convert_tokens_to_ids(activation_token)
 activation_pos = (
     (prompt_input_ids[0] == activation_token_id).nonzero(as_tuple=False)[0].item()
 )
-token_embeddings = av_model.get_input_embeddings()
-before_embeds = token_embeddings(prompt_input_ids[:, :activation_pos])
-after_embeds = token_embeddings(prompt_input_ids[:, activation_pos + 1 :])
-before_mask = prompt_attention_mask[:, :activation_pos]
-after_mask = prompt_attention_mask[:, activation_pos + 1 :]
 
 # this will warning because it's AutoModel and no lm_head
 ar_model = AutoModel.from_pretrained(
@@ -204,6 +199,12 @@ end_event = torch.cuda.Event(enable_timing=True)
 
 for i in range(EPOCHS):
     for batch_idx, leela_activations in enumerate(train_dataloader):
+        token_embeddings = av_model.get_input_embeddings()
+        before_embeds = token_embeddings(prompt_input_ids[:, :activation_pos])
+        after_embeds = token_embeddings(prompt_input_ids[:, activation_pos + 1 :])
+        before_mask = prompt_attention_mask[:, :activation_pos]
+        after_mask = prompt_attention_mask[:, activation_pos + 1 :]
+        
         av_embeds = av_projectors(leela_activations)
         batch_before_embeds = before_embeds.expand(B, -1, -1)
         batch_after_embeds = after_embeds.expand(B, -1, -1)
