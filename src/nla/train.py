@@ -28,7 +28,7 @@ av_device = "cuda:0"
 ar_device = "cuda:1"
 frozen_device = "cuda:2"
 G = 8
-B = 1
+B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.15
 LR = 1e-5
@@ -59,7 +59,7 @@ class LeelaActivationDataset(Dataset):
     ):
         self.device = device
         self.activation_dir = Path(activation_dir)
-        jsonl_path = self.activation_dir.parent / "shard-500k.jsonl"
+        jsonl_path = self.activation_dir.parent / "shard-1M.jsonl"
         self.activation_paths = []
         with jsonl_path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -199,34 +199,33 @@ end_event = torch.cuda.Event(enable_timing=True)
 
 for i in range(EPOCHS):
     for batch_idx, leela_activations in enumerate(train_dataloader):
-        token_embeddings = av_model.get_input_embeddings()
-        before_embeds = token_embeddings(prompt_input_ids[:, :activation_pos])
-        after_embeds = token_embeddings(prompt_input_ids[:, activation_pos + 1 :])
-        before_mask = prompt_attention_mask[:, :activation_pos]
-        after_mask = prompt_attention_mask[:, activation_pos + 1 :]
-        
-        av_embeds = av_projectors(leela_activations)
-        batch_before_embeds = before_embeds.expand(B, -1, -1)
-        batch_after_embeds = after_embeds.expand(B, -1, -1)
-        batch_before_mask = before_mask.expand(B, -1)
-        batch_after_mask = after_mask.expand(B, -1)
-        inputs_embeds = torch.cat(
-            [batch_before_embeds, av_embeds, batch_after_embeds], dim=1
-        )
-        av_mask = torch.ones(
-            B,
-            av_checkpoint["prefix_len"],
-            dtype=prompt_attention_mask.dtype,
-            device=av_device,
-        )
-        attention_mask = torch.cat(
-            [batch_before_mask, av_mask, batch_after_mask], dim=1
-        )
-        inputs_embeds = inputs_embeds.repeat_interleave(G, dim=0)
-        attention_mask = attention_mask.repeat_interleave(G, dim=0)
-
         start_event.record()
         with torch.no_grad():
+            token_embeddings = av_model.get_input_embeddings()
+            before_embeds = token_embeddings(prompt_input_ids[:, :activation_pos])
+            after_embeds = token_embeddings(prompt_input_ids[:, activation_pos + 1 :])
+            before_mask = prompt_attention_mask[:, :activation_pos]
+            after_mask = prompt_attention_mask[:, activation_pos + 1 :]
+
+            av_embeds = av_projectors(leela_activations)
+            batch_before_embeds = before_embeds.expand(B, -1, -1)
+            batch_after_embeds = after_embeds.expand(B, -1, -1)
+            batch_before_mask = before_mask.expand(B, -1)
+            batch_after_mask = after_mask.expand(B, -1)
+            inputs_embeds = torch.cat(
+                [batch_before_embeds, av_embeds, batch_after_embeds], dim=1
+            )
+            av_mask = torch.ones(
+                B,
+                av_checkpoint["prefix_len"],
+                dtype=prompt_attention_mask.dtype,
+                device=av_device,
+            )
+            attention_mask = torch.cat(
+                [batch_before_mask, av_mask, batch_after_mask], dim=1
+            )
+            inputs_embeds = inputs_embeds.repeat_interleave(G, dim=0)
+            attention_mask = attention_mask.repeat_interleave(G, dim=0)
             rollouts = av_model.generate(  # type: ignore
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -239,99 +238,165 @@ for i in range(EPOCHS):
             )
         end_event.record()
         torch.cuda.synchronize()
-        print("time taken for generate: ", start_event.elapsed_time(end_event) / 1000)
-
-        generated_attention_mask = (rollouts != av_tokenizer.pad_token_id).long()
-
-        reconstructed = ar_model(
-            input_ids=rollouts.to(ar_device),
-            attention_mask=generated_attention_mask.to(ar_device),
-            return_dict=True,
-            use_cache=False,
+        print(
+            "time taken for generate: ",
+            start_event.elapsed_time(end_event) / 1000,
         )
 
-        final_hidden = reconstructed.last_hidden_state
-        ar_mask = generated_attention_mask.to(ar_device)
-        last_token_index = ar_mask.sum(dim=1).clamp_min(1) - 1
-        batch_index = torch.arange(rollouts.shape[0], device=ar_device)
-        final_summary_hidden = final_hidden[batch_index, last_token_index]
-
-        final_summary_hidden = final_summary_hidden.to(dtype=torch.bfloat16)
-        activation_prefix = ar_projectors(final_summary_hidden)
-        mse_tensor = ((activation_prefix - leela_activations.to(ar_device)) ** 2).mean(
-            dim=(1, 2)
-        )
-        cos_loss = 1 - F.cosine_similarity(
-            activation_prefix.view(G, -1),
-            leela_activations.to(ar_device).expand(G, -1, -1).view(G, -1),
-        )
-        ar_loss = mse_tensor.mean() + COSINE_WEIGHT * cos_loss.mean()
+        start_event.record()
         ar_optimizer.zero_grad()
-        ar_loss.backward()
+        av_optimizer.zero_grad()
+        ar_loss = torch.Tensor(0).to(ar_device)
+        av_loss = torch.Tensor(0).to(av_device)
+        # say G = 8, B = 4
+        # 32 rollouts
+        # k = 0 we want 0 - 7
+        # k = 1 we want 8 - 15
+        # we want k * G to k * G + G
+        for k in range(B):
+            input_embeds_this_batch = inputs_embeds[k * G : k * G + G]
+            attention_mask_this_batch = attention_mask[k * G : k * G + G]
+            sliced_rollouts = rollouts[k * G : k * G + G]
+            generated_attention_mask = (
+                sliced_rollouts != av_tokenizer.pad_token_id
+            ).long()
+
+            ar_generated_attention_mask = generated_attention_mask.to(ar_device)
+            sliced_rollouts_ar = sliced_rollouts.to(ar_device)
+
+            token_embeddings = av_model.get_input_embeddings()
+            sliced_leela_activations = leela_activations[k].unsqueeze(0)  # [1, 64, 512]
+            generated_embeds = token_embeddings(sliced_rollouts)
+
+            full_embeds = torch.cat([input_embeds_this_batch, generated_embeds], dim=1)
+            full_mask = torch.cat(
+                [
+                    attention_mask_this_batch,
+                    generated_attention_mask,
+                ],
+                dim=1,
+            )
+
+            reconstructed = ar_model(
+                input_ids=sliced_rollouts_ar,
+                attention_mask=ar_generated_attention_mask,
+                return_dict=True,
+                use_cache=False,
+            )
+            av_outputs = av_model(
+                inputs_embeds=full_embeds,
+                attention_mask=full_mask,
+                use_cache=False,
+            )
+            with torch.no_grad():
+                frozen_model_outputs = frozen_model(
+                    inputs_embeds=full_embeds.detach().to(frozen_device),
+                    attention_mask=full_mask.to(frozen_device),
+                    use_cache=False,
+                )
+
+            # we want the last token in the last layer
+            final_hidden = reconstructed.last_hidden_state
+            last_token_index = ar_generated_attention_mask.sum(dim=1).clamp_min(1) - 1
+            batch_index = torch.arange(sliced_rollouts.shape[0], device=ar_device)
+            final_summary_hidden = final_hidden[batch_index, last_token_index].to(
+                dtype=torch.bfloat16
+            )
+            reconstructed_vector = ar_projectors(final_summary_hidden)
+            sliced_leela_activations_ar = sliced_leela_activations.to(ar_device)
+            mse_tensor = (
+                (reconstructed_vector - sliced_leela_activations_ar) ** 2
+            ).mean(dim=(1, 2))
+            cos_loss = 1 - F.cosine_similarity(
+                reconstructed_vector.flatten(1),
+                sliced_leela_activations_ar.flatten(1),
+            )
+
+            ar_loss_this_mini_batch = (
+                mse_tensor.mean() + COSINE_WEIGHT * cos_loss.mean()
+            )
+            (ar_loss_this_mini_batch / B).backward()
+            ar_loss += ar_loss_this_mini_batch.detach()
+
+            r = -mse_tensor - COSINE_WEIGHT * cos_loss
+            r = (r - r.mean()) / (r.std() + 1e-8)
+            r = r.detach()
+
+            prompt_len = inputs_embeds.shape[1]
+            logits = av_outputs.logits[
+                :, prompt_len - 1 : -1, :
+            ]  # [G, seq_len, vocab_size]
+            log_probs = F.log_softmax(logits, dim=-1)  # log softmaxes over vocab_size
+            token_ids = sliced_rollouts.unsqueeze(-1)  # [G, seq_len, 1]
+            chosen_token_log_probs = log_probs.gather(dim=-1, index=token_ids).squeeze(
+                -1
+            )  # index by G & token id, remove trailing dim to create [G, seq_len] probabilities tensor
+            # mask out padding tokens
+            chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
+            # log probs for each of the G rollouts!
+            seq_log_probs = chosen_token_log_probs.sum(dim=-1)
+
+            with torch.no_grad():
+                frozen_logits = frozen_model_outputs.logits[:, prompt_len - 1 : -1, :]
+                # note: frozen_log_probs is a massive tensor, so moving this to F.kl_div takes lots of time
+                frozen_log_probs = F.log_softmax(
+                    frozen_logits, dim=-1
+                )  # [G, seq_len, vocab_size]
+
+                # to avoid the vocab_size dimension, i'm gonna use Schulman's K3 approximation
+                # this is quite common! see here: http://joschu.net/blog/kl-approx.html
+                frozen_chosen_log_probs = frozen_log_probs.gather(
+                    dim=-1, index=token_ids.to(frozen_device)
+                ).squeeze(
+                    -1
+                )  # only grab chosen token log probs, [G, seq_len]
+            log_r = torch.clamp(
+                frozen_chosen_log_probs - chosen_token_log_probs.to(frozen_device),
+                min=-20,
+                max=20,
+            )
+            kl_approx = torch.exp(log_r) - 1 - log_r
+            kl_approx = kl_approx.to(av_device)  # [G, seq_len]
+
+            # kl_approx substitutes for this!
+            # kl_div_no_reduce = F.kl_div(
+            #     frozen_log_probs.to(av_device, non_blocking=True),
+            #     log_probs,
+            #     reduction="none",
+            #     log_target=True,
+            # )
+            # kl_div_per_token = kl_div_no_reduce.sum(dim=-1)  # [G, seq_len]
+            # masked_kl_div = kl_div_per_token * generated_attention_mask
+
+            masked_kl_div = kl_approx * generated_attention_mask
+            valid_tokens_per_rollout = generated_attention_mask.sum(dim=-1).clamp_min(
+                1
+            )  # [G]
+            kl_div_per_rollout = masked_kl_div.sum(dim=-1) / valid_tokens_per_rollout
+
+            av_loss_this_mini_batch = (
+                -(seq_log_probs * r.to(av_device, non_blocking=True)).mean()
+                + KL_WEIGHT * kl_div_per_rollout.mean()
+            )
+            (av_loss_this_mini_batch / B).backward()
+            av_loss += av_loss_this_mini_batch.detach()
+
         torch.nn.utils.clip_grad_norm_(
             list(ar_projectors.parameters()) + list(ar_model.parameters()),
             max_norm=1.0,
         )
         ar_optimizer.step()
-
-        r = -mse_tensor - COSINE_WEIGHT * cos_loss
-        r = (r - r.mean()) / (r.std() + 1e-8)
-        r = r.detach()
-
-        generated_embeds = av_model.get_input_embeddings()(rollouts.to(av_device))
-        full_embeds = torch.cat([inputs_embeds, generated_embeds], dim=1)
-        full_mask = torch.cat(
-            [attention_mask.to(av_device), generated_attention_mask.to(av_device)],
-            dim=1,
-        )
-
-        av_outputs = av_model(inputs_embeds=full_embeds, attention_mask=full_mask)
-        prompt_len = inputs_embeds.shape[1]
-        logits = av_outputs.logits[
-            :, prompt_len - 1 : -1, :
-        ]  # [G, seq_len, vocab_size]
-        log_probs = F.log_softmax(logits, dim=-1)  # log softmaxes over vocab_size
-        token_ids = rollouts.unsqueeze(-1).to(av_device)  # [G, seq_len, 1]
-        chosen_token_log_probs = log_probs.gather(dim=-1, index=token_ids).squeeze(
-            -1
-        )  # index by G & token id, remove trailing dim to create [G, seq_len] probabilities tensor
-        # mask out padding tokens
-        chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask.to(
-            av_device
-        )
-        # log probs for each of the G rollouts!
-        seq_log_probs = chosen_token_log_probs.sum(dim=-1)
-
-        with torch.no_grad():
-            frozen_model_outputs = frozen_model(
-                inputs_embeds=full_embeds.detach().to(frozen_device),
-                attention_mask=full_mask.to(frozen_device),
-                use_cache=False,  # it's one forward pass, so we don't really need a kv cache
-            )
-            frozen_logits = frozen_model_outputs.logits[:, prompt_len - 1 : -1, :]
-            frozen_log_probs = F.log_softmax(frozen_logits, dim=-1)
-
-        frozen_log_probs = frozen_log_probs.to(av_device)
-        kl_div_no_reduce = F.kl_div(
-            frozen_log_probs, log_probs, reduction="none", log_target=True
-        )
-        kl_div_per_token = kl_div_no_reduce.sum(dim=-1)  # [G, seq_len]
-        response_mask_frozen = generated_attention_mask.to(av_device)
-        masked_kl_div = kl_div_per_token * response_mask_frozen
-        valid_tokens_per_rollout = response_mask_frozen.sum(dim=-1).clamp_min(1)  # [G]
-        kl_div_per_rollout = masked_kl_div.sum(dim=-1) / valid_tokens_per_rollout
-
-        av_loss = (
-            -(seq_log_probs * r.to(av_device)).mean()
-            + KL_WEIGHT * kl_div_per_rollout.mean()
-        )
-        av_optimizer.zero_grad()
-        av_loss.backward()
         torch.nn.utils.clip_grad_norm_(
             list(av_projectors.parameters()) + list(av_model.parameters()),
             max_norm=1.0,
         )
         av_optimizer.step()
+        end_event.record()
+        torch.cuda.synchronize()
+        print(
+            "time taken for loop over all batches is: ",
+            start_event.elapsed_time(end_event) / 1000,
+        )
 
         absolute_step_index = i * len(train_dataloader) + batch_idx
         # if absolute_step_index % 100 == 0:
