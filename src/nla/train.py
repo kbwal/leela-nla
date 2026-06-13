@@ -127,6 +127,8 @@ av_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
     attn_implementation="flash_attention_2",
 )
+av_transformer = av_model.model
+av_lm_head = av_model.lm_head
 av_model.gradient_checkpointing_enable()
 av_checkpoint = torch.load(
     f"{av_checkpoint_dir}/av_projector.pt", map_location=av_device
@@ -191,6 +193,8 @@ train_dataloader = DataLoader(
 )
 
 av_model = torch.compile(av_model, dynamic=True)
+av_transformer = torch.compile(av_transformer, dynamic=True)
+av_lm_head = torch.compile(av_lm_head, dynamic=True)
 ar_model = torch.compile(ar_model, dynamic=True)
 frozen_model = torch.compile(frozen_model, dynamic=True)
 
@@ -283,11 +287,11 @@ for i in range(EPOCHS):
                 return_dict=True,
                 use_cache=False,
             )
-            av_outputs = av_model(
+            av_outputs = av_transformer(
                 inputs_embeds=full_embeds,
                 attention_mask=full_mask,
                 use_cache=False,
-            )
+            ).last_hidden_state
             with torch.no_grad():
                 frozen_model_outputs = frozen_model(
                     inputs_embeds=full_embeds.detach().to(frozen_device),
@@ -315,7 +319,14 @@ for i in range(EPOCHS):
             ar_loss_this_mini_batch = (
                 mse_tensor.mean() + COSINE_WEIGHT * cos_loss.mean()
             )
+            # start_event.record()
             (ar_loss_this_mini_batch / B).backward()
+            # end_event.record()
+            # torch.cuda.synchronize()
+            # print(
+            #     "time taken for ar bwd: ",
+            #     start_event.elapsed_time(end_event) / 1000,
+            # )
             ar_loss += ar_loss_this_mini_batch.detach()
 
             r = -mse_tensor - COSINE_WEIGHT * cos_loss
@@ -323,14 +334,18 @@ for i in range(EPOCHS):
             r = r.detach()
 
             prompt_len = inputs_embeds.shape[1]
-            logits = av_outputs.logits[
-                :, prompt_len - 1 : -1, :
-            ]  # [G, seq_len, vocab_size]
-            log_probs = F.log_softmax(logits, dim=-1)  # log softmaxes over vocab_size
+            # this skips over the prompt before applying the lm_head
+            # as prompt tokens are ignored anyways
+            generated_av_outputs = av_outputs[:, prompt_len - 1 : -1, :].contiguous()
+            logits = av_lm_head(generated_av_outputs)
             token_ids = sliced_rollouts.unsqueeze(-1)  # [G, seq_len, 1]
-            chosen_token_log_probs = log_probs.gather(dim=-1, index=token_ids).squeeze(
-                -1
-            )  # index by G & token id, remove trailing dim to create [G, seq_len] probabilities tensor
+            chosen_token_log_probs = -F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                token_ids.squeeze(-1).view(-1),
+                reduction="none",
+            ).view(
+                G, -1
+            )  # [G, seq_len]
             # mask out padding tokens
             chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
             # log probs for each of the G rollouts!
@@ -338,18 +353,15 @@ for i in range(EPOCHS):
 
             with torch.no_grad():
                 frozen_logits = frozen_model_outputs.logits[:, prompt_len - 1 : -1, :]
-                # note: frozen_log_probs is a massive tensor, so moving this to F.kl_div takes lots of time
-                frozen_log_probs = F.log_softmax(
-                    frozen_logits, dim=-1
-                )  # [G, seq_len, vocab_size]
+                frozen_chosen_log_probs = -F.cross_entropy(
+                    frozen_logits.reshape(-1, frozen_logits.size(-1)),
+                    token_ids.to(frozen_device).squeeze(-1).view(-1),
+                    reduction="none",
+                ).view(
+                    G, -1
+                )  # [G, seq_len]
 
-                # to avoid the vocab_size dimension, i'm gonna use Schulman's K3 approximation
-                # this is quite common! see here: http://joschu.net/blog/kl-approx.html
-                frozen_chosen_log_probs = frozen_log_probs.gather(
-                    dim=-1, index=token_ids.to(frozen_device)
-                ).squeeze(
-                    -1
-                )  # only grab chosen token log probs, [G, seq_len]
+            # using Schulman's K3 approximation: http://joschu.net/blog/kl-approx.html
             log_r = torch.clamp(
                 frozen_chosen_log_probs - chosen_token_log_probs.to(frozen_device),
                 min=-20,
@@ -357,16 +369,6 @@ for i in range(EPOCHS):
             )
             kl_approx = torch.exp(log_r) - 1 - log_r
             kl_approx = kl_approx.to(av_device)  # [G, seq_len]
-
-            # kl_approx substitutes for this!
-            # kl_div_no_reduce = F.kl_div(
-            #     frozen_log_probs.to(av_device, non_blocking=True),
-            #     log_probs,
-            #     reduction="none",
-            #     log_target=True,
-            # )
-            # kl_div_per_token = kl_div_no_reduce.sum(dim=-1)  # [G, seq_len]
-            # masked_kl_div = kl_div_per_token * generated_attention_mask
 
             masked_kl_div = kl_approx * generated_attention_mask
             valid_tokens_per_rollout = generated_attention_mask.sum(dim=-1).clamp_min(
@@ -378,7 +380,14 @@ for i in range(EPOCHS):
                 -(seq_log_probs * r.to(av_device, non_blocking=True)).mean()
                 + KL_WEIGHT * kl_div_per_rollout.mean()
             )
+            # start_event.record()
             (av_loss_this_mini_batch / B).backward()
+            # end_event.record()
+            # torch.cuda.synchronize()
+            # print(
+            #     "time taken for av bwd: ",
+            #     start_event.elapsed_time(end_event) / 1000,
+            # )
             av_loss += av_loss_this_mini_batch.detach()
 
         torch.nn.utils.clip_grad_norm_(
@@ -410,6 +419,9 @@ for i in range(EPOCHS):
         #             "iteration": absolute_step_index,
         #         }
         #     )
+        if absolute_step_index > 0 and absolute_step_index % 2500 == 0:
+            # do test split check here!
+            pass
         print(absolute_step_index)
         if absolute_step_index == 11:
             break
