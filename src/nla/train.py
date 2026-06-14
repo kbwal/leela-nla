@@ -125,7 +125,7 @@ av_model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="flash_attention_2",
 )
 av_model.config.pad_token_id = av_tokenizer.pad_token_id
-av_model.gradient_checkpointing_enable()
+# av_model.gradient_checkpointing_enable()
 av_checkpoint = torch.load(
     f"{av_checkpoint_dir}/av_projector.pt", map_location=av_device
 )
