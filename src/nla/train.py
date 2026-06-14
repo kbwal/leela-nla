@@ -23,6 +23,8 @@ KL_WEIGHT = 0.15
 LR = 1e-5
 EPOCHS = 1
 MAX_CHECKPOINTS = 3
+EVAL_EVERY = 1000
+CHECKPOINT_EVERY = 1000
 
 config = {
     "learning_rate": LR,
@@ -31,6 +33,8 @@ config = {
     "epochs": EPOCHS,
     "cosine_weight": COSINE_WEIGHT,
     "kl_weight": KL_WEIGHT,
+    "eval_every": EVAL_EVERY,
+    "checkpoint_every": CHECKPOINT_EVERY,
 }
 
 wandb.login()
@@ -107,6 +111,7 @@ class ARReconstructor(nn.Module):
 
 
 av_tokenizer = AutoTokenizer.from_pretrained(av_checkpoint_dir, trust_remote_code=True)
+ar_tokenizer = AutoTokenizer.from_pretrained(ar_checkpoint_dir, trust_remote_code=True)
 av_model = AutoModelForCausalLM.from_pretrained(
     av_checkpoint_dir,
     dtype=torch.bfloat16,
@@ -114,6 +119,7 @@ av_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
     attn_implementation="flash_attention_2",
 )
+av_model.config.pad_token_id = av_tokenizer.pad_token_id
 av_model.gradient_checkpointing_enable()
 av_checkpoint = torch.load(
     f"{av_checkpoint_dir}/av_projector.pt", map_location=av_device
@@ -144,6 +150,7 @@ ar_model = AutoModel.from_pretrained(
     device_map=ar_device,
     trust_remote_code=True,
 )
+ar_model.config.pad_token_id = ar_tokenizer.pad_token_id
 ar_model.gradient_checkpointing_enable()
 ar_checkpoint = torch.load(f"{ar_checkpoint_dir}/ar_head.pt", map_location=ar_device)
 ar_projectors = ARReconstructor(
@@ -164,6 +171,7 @@ frozen_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
     attn_implementation="flash_attention_2",
 )
+frozen_model.config.pad_token_id = av_tokenizer.pad_token_id
 frozen_model.eval()
 frozen_model.requires_grad_(False)
 
@@ -180,6 +188,11 @@ train_dataloader = DataLoader(
 av_model = torch.compile(av_model, dynamic=True)
 ar_model = torch.compile(ar_model, dynamic=True)
 frozen_model = torch.compile(frozen_model, dynamic=True)
+
+av_model.train()
+ar_model.train()
+av_projectors.train()
+ar_projectors.train()
 
 for i in range(EPOCHS):
     for batch_idx, leela_activations in enumerate(tqdm(train_dataloader)):
@@ -213,7 +226,8 @@ for i in range(EPOCHS):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 max_new_tokens=200,
-                pad_token_id=av_tokenizer.eos_token_id,
+                pad_token_id=av_tokenizer.pad_token_id,
+                eos_token_id=av_tokenizer.eos_token_id,
                 do_sample=True,
                 temperature=0.6,
                 top_p=0.9,
@@ -224,6 +238,9 @@ for i in range(EPOCHS):
         av_optimizer.zero_grad()
         ar_loss = torch.tensor(0.0, device=ar_device)
         av_loss = torch.tensor(0.0, device=av_device)
+        train_kl_div = torch.tensor(0.0, device=av_device)
+        train_mse = torch.tensor(0.0, device=ar_device)
+        train_cosine = torch.tensor(0.0, device=ar_device)
         for k in range(B):
             sliced_rollouts = rollouts[k * G : k * G + G]
             generated_attention_mask = (
@@ -304,8 +321,11 @@ for i in range(EPOCHS):
             (ar_loss_this_mini_batch / B).backward()
             ar_loss += ar_loss_this_mini_batch.detach() / B
 
-            r = -mse_tensor - COSINE_WEIGHT * cos_loss
-            r = (r - r.mean()) / (r.std() + 1e-8)
+            raw_reward = -mse_tensor - COSINE_WEIGHT * cos_loss
+            train_mse += mse_tensor.mean().detach() / B
+            train_cosine += cos_loss.mean().detach() / B
+
+            r = (raw_reward - raw_reward.mean()) / (raw_reward.std() + 1e-8)
             r = r.detach()
 
             prompt_len = input_embeds_this_batch.shape[1]
@@ -350,6 +370,7 @@ for i in range(EPOCHS):
                 1
             )  # [G]
             kl_div_per_rollout = masked_kl_div.sum(dim=-1) / valid_tokens_per_rollout
+            train_kl_div += kl_div_per_rollout.mean().detach() / B
 
             av_loss_this_mini_batch = (
                 -(seq_log_probs * r.to(av_device, non_blocking=True)).mean()
@@ -358,12 +379,12 @@ for i in range(EPOCHS):
             (av_loss_this_mini_batch / B).backward()
             av_loss += av_loss_this_mini_batch.detach() / B
 
-        torch.nn.utils.clip_grad_norm_(
+        ar_grad_norm = torch.nn.utils.clip_grad_norm_(
             list(ar_projectors.parameters()) + list(ar_model.parameters()),
             max_norm=1.0,
         )
         ar_optimizer.step()
-        torch.nn.utils.clip_grad_norm_(
+        av_grad_norm = torch.nn.utils.clip_grad_norm_(
             list(av_projectors.parameters()) + list(av_model.parameters()),
             max_norm=1.0,
         )
@@ -375,16 +396,20 @@ for i in range(EPOCHS):
                 {
                     "train/av_loss": av_loss.item(),
                     "train/ar_loss": ar_loss.item(),
-                    "train/kl_div_mean": kl_div_per_rollout.mean().item(),
-                    "train/mse_term": mse_tensor.mean().item(),
-                    "train/cosine_term": cos_loss.mean().item(),
+                    "train/kl_div_mean": train_kl_div.item(),
+                    "train/mse_term": train_mse.item(),
+                    "train/cosine_term": train_cosine.item(),
+                    "train/av_grad_norm": av_grad_norm.item(),
+                    "train/ar_grad_norm": ar_grad_norm.item(),
+                    "train/av_lr": av_optimizer.param_groups[0]["lr"],
+                    "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
                     "iteration": absolute_step_index,
                 }
             )
         ar_test_loss = torch.tensor(0.0, device=ar_device)
         av_test_loss = torch.tensor(0.0, device=av_device)
         max_test_batches = 30
-        if absolute_step_index > 0 and absolute_step_index % 2500 == 0:
+        if absolute_step_index > 0 and absolute_step_index % EVAL_EVERY == 0:
             print("starting eval at step: ", absolute_step_index)
             av_model.eval()
             ar_model.eval()
@@ -431,7 +456,8 @@ for i in range(EPOCHS):
                         inputs_embeds=inputs_embeds,
                         attention_mask=attention_mask,
                         max_new_tokens=200,
-                        pad_token_id=av_tokenizer.eos_token_id,
+                        pad_token_id=av_tokenizer.pad_token_id,
+                        eos_token_id=av_tokenizer.eos_token_id,
                         do_sample=True,
                         temperature=0.6,
                         top_p=0.9,
@@ -561,33 +587,43 @@ for i in range(EPOCHS):
                 }
             )
 
-        if absolute_step_index > 0 and absolute_step_index % 1000 == 0:
-            checkpoint_dir = (
-                f"../../outputs/nla_training/checkpoint{absolute_step_index}"
+        if absolute_step_index > 0 and absolute_step_index % CHECKPOINT_EVERY == 0:
+            checkpoint_dir = Path(
+                f"../../outputs/nla_training/checkpoint-{absolute_step_index:05d}"
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
+            av_save_dir = checkpoint_dir / "av"
+            ar_save_dir = checkpoint_dir / "ar"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            av_save_dir.mkdir(parents=True, exist_ok=True)
+            ar_save_dir.mkdir(parents=True, exist_ok=True)
             print("saving checkpoint at step: ", absolute_step_index)
-            av_model.save_pretrained(f"{checkpoint_dir}/av_model")
-            ar_model.save_pretrained(f"{checkpoint_dir}/ar_model")
-            av_tokenizer.save_pretrained(f"{checkpoint_dir}/av_tokenizer")
+            av_model.save_pretrained(av_save_dir / "model")
+            ar_model.save_pretrained(ar_save_dir / "model")
+            av_tokenizer.save_pretrained(av_save_dir / "tokenizer")
+            ar_tokenizer.save_pretrained(ar_save_dir / "tokenizer")
 
             torch.save(
                 {
-                    "iteration": i,
+                    "epoch": i,
+                    "batch_idx": batch_idx,
+                    "absolute_step_index": absolute_step_index,
                     "av_projector_state_dict": av_projectors.state_dict(),
-                    "av_optimizer_state_dict": av_optimizer.state_dict(),
                     "activation_dim": av_checkpoint["activation_dim"],
                     "hidden_size": av_checkpoint["hidden_size"],
                     "prefix_len": av_checkpoint["prefix_len"],
+                    "activation_token": activation_token,
+                    "activation_token_id": activation_token_id,
                 },
-                f"{checkpoint_dir}/av_projector.pt",
+                av_save_dir / "projector.pt",
             )
+            torch.save(av_optimizer.state_dict(), av_save_dir / "optimizer.pt")
 
             torch.save(
                 {
-                    "iteration": i,
+                    "epoch": i,
+                    "batch_idx": batch_idx,
+                    "absolute_step_index": absolute_step_index,
                     "ar_reconstructor_state_dict": ar_projectors.state_dict(),
-                    "ar_optimizer_state_dict": ar_optimizer.state_dict(),
                     "hidden_size": ar_checkpoint["hidden_size"],
                     "activation_dim": ar_checkpoint["activation_dim"],
                     "prefix_len": ar_checkpoint["prefix_len"],
@@ -595,18 +631,30 @@ for i in range(EPOCHS):
                         "reconstructor_hidden_size"
                     ),
                 },
-                f"{checkpoint_dir}/ar_head.pt",
+                ar_save_dir / "head.pt",
             )
+            torch.save(ar_optimizer.state_dict(), ar_save_dir / "optimizer.pt")
 
             torch.save(
                 {
                     "torch_rng_state": torch.get_rng_state(),
                     "cuda_rng_state": torch.cuda.get_rng_state_all(),
                 },
-                f"{checkpoint_dir}/rng_state.pt",
+                checkpoint_dir / "rng_state.pt",
             )
 
-            with open(f"{checkpoint_dir}/config.json", "w") as f:
+            with (checkpoint_dir / "train_state.json").open("w") as f:
+                json.dump(
+                    {
+                        "epoch": i,
+                        "batch_idx": batch_idx,
+                        "absolute_step_index": absolute_step_index,
+                    },
+                    f,
+                    indent=4,
+                )
+
+            with (checkpoint_dir / "config.json").open("w") as f:
                 json.dump(config, f, indent=4)
 
             print("saved checkpoint at iteration: ", absolute_step_index)
