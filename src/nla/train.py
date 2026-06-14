@@ -404,7 +404,8 @@ for i in range(EPOCHS):
                     "train/av_lr": av_optimizer.param_groups[0]["lr"],
                     "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
                     "iteration": absolute_step_index,
-                }
+                },
+                step=absolute_step_index,
             )
         ar_test_loss = torch.tensor(0.0, device=ar_device)
         av_test_loss = torch.tensor(0.0, device=av_device)
@@ -413,7 +414,7 @@ for i in range(EPOCHS):
             print("starting eval at step: ", absolute_step_index)
             av_model.eval()
             ar_model.eval()
-            test_dataset = LeelaActivationDataset(split="test")
+            test_dataset = LeelaActivationDataset(split="val")
             test_dl = DataLoader(
                 dataset=test_dataset, batch_size=B, shuffle=True, drop_last=True
             )
@@ -578,13 +579,14 @@ for i in range(EPOCHS):
                             + KL_WEIGHT * kl_div_per_rollout.mean()
                         )
                         av_test_loss += av_loss_this_mini_batch.detach() / B
-            print("test/av_loss: ", av_test_loss.item() / max_test_batches)
-            print("test/ar_loss: ", ar_test_loss.item() / max_test_batches)
+            print("val/av_loss: ", av_test_loss.item() / max_test_batches)
+            print("val/ar_loss: ", ar_test_loss.item() / max_test_batches)
             wandb.log(
                 {
-                    "test/av_loss": av_test_loss.item() / max_test_batches,
-                    "test/ar_loss": ar_test_loss.item() / max_test_batches,
-                }
+                    "val/av_loss": av_test_loss.item() / max_test_batches,
+                    "val/ar_loss": ar_test_loss.item() / max_test_batches,
+                },
+                step=absolute_step_index,
             )
 
         if absolute_step_index > 0 and absolute_step_index % CHECKPOINT_EVERY == 0:
@@ -597,10 +599,10 @@ for i in range(EPOCHS):
             av_save_dir.mkdir(parents=True, exist_ok=True)
             ar_save_dir.mkdir(parents=True, exist_ok=True)
             print("saving checkpoint at step: ", absolute_step_index)
-            av_model.save_pretrained(av_save_dir / "model")
-            ar_model.save_pretrained(ar_save_dir / "model")
-            av_tokenizer.save_pretrained(av_save_dir / "tokenizer")
-            ar_tokenizer.save_pretrained(ar_save_dir / "tokenizer")
+            av_model.save_pretrained(av_save_dir)
+            ar_model.save_pretrained(ar_save_dir)
+            av_tokenizer.save_pretrained(av_save_dir)
+            ar_tokenizer.save_pretrained(ar_save_dir)
 
             torch.save(
                 {
@@ -614,7 +616,7 @@ for i in range(EPOCHS):
                     "activation_token": activation_token,
                     "activation_token_id": activation_token_id,
                 },
-                av_save_dir / "projector.pt",
+                av_save_dir / "av_projector.pt",
             )
             torch.save(av_optimizer.state_dict(), av_save_dir / "optimizer.pt")
 
@@ -631,7 +633,7 @@ for i in range(EPOCHS):
                         "reconstructor_hidden_size"
                     ),
                 },
-                ar_save_dir / "head.pt",
+                ar_save_dir / "ar_head.pt",
             )
             torch.save(ar_optimizer.state_dict(), ar_save_dir / "optimizer.pt")
 
