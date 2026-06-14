@@ -1,7 +1,12 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoModel,
+    get_cosine_schedule_with_warmup,
+)
 import bitsandbytes as bnb
 import wandb
 import os
@@ -183,6 +188,17 @@ train_dataloader = DataLoader(
     batch_size=B,
     shuffle=True,
     drop_last=True,
+)
+
+av_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=av_optimizer,
+    num_warmup_steps=int(len(train_dataloader) * EPOCHS * 0.1),
+    num_training_steps=len(train_dataloader) * EPOCHS,
+)
+ar_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=ar_optimizer,
+    num_warmup_steps=int(len(train_dataloader) * EPOCHS * 0.1),
+    num_training_steps=len(train_dataloader) * EPOCHS,
 )
 
 av_model = torch.compile(av_model, dynamic=True)
@@ -384,14 +400,16 @@ for i in range(EPOCHS):
             max_norm=1.0,
         )
         ar_optimizer.step()
+        ar_scheduler.step()
         av_grad_norm = torch.nn.utils.clip_grad_norm_(
             list(av_projectors.parameters()) + list(av_model.parameters()),
             max_norm=1.0,
         )
         av_optimizer.step()
+        av_scheduler.step()
 
         absolute_step_index = i * len(train_dataloader) + batch_idx
-        if absolute_step_index % 100 == 0:
+        if absolute_step_index % 50 == 0:
             wandb.log(
                 {
                     "train/av_loss": av_loss.item(),
@@ -619,6 +637,7 @@ for i in range(EPOCHS):
                 av_save_dir / "av_projector.pt",
             )
             torch.save(av_optimizer.state_dict(), av_save_dir / "optimizer.pt")
+            torch.save(av_scheduler.state_dict(), av_save_dir / "scheduler.pt")
 
             torch.save(
                 {
@@ -636,6 +655,7 @@ for i in range(EPOCHS):
                 ar_save_dir / "ar_head.pt",
             )
             torch.save(ar_optimizer.state_dict(), ar_save_dir / "optimizer.pt")
+            torch.save(ar_scheduler.state_dict(), ar_save_dir / "scheduler.pt")
 
             torch.save(
                 {
