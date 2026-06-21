@@ -185,8 +185,14 @@ frozen_model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="flash_attention_2",
 )
 frozen_model.config.pad_token_id = av_tokenizer.pad_token_id
+frozen_projectors = AVProjector(
+    av_checkpoint["activation_dim"], av_checkpoint["hidden_size"]
+).to(frozen_device, dtype=torch.bfloat16)
+frozen_projectors.load_state_dict(av_checkpoint["av_projector_state_dict"])
 frozen_model.eval()
 frozen_model.requires_grad_(False)
+frozen_projectors.eval()
+frozen_projectors.requires_grad_(False)
 
 saved_checkpoints = []
 
@@ -269,10 +275,52 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             attention_mask=full_attention_mask,
             use_cache=False,
         ).last_hidden_state
-        old_prompt_len = inputs_embeds.shape[1]
+        prompt_len = inputs_embeds.shape[1]
         generated_old_outputs = (
-            av_outputs[:, old_prompt_len - 1 : -1, :].detach().contiguous()
+            av_outputs[:, prompt_len - 1 : -1, :].detach().contiguous()
         )
+
+        frozen_embeds = frozen_projectors(leela_activations.to(frozen_device))
+        frozen_inputs_embeds = torch.cat(
+            [
+                batch_before_embeds.to(frozen_device),
+                frozen_embeds,
+                batch_after_embeds.to(frozen_device),
+            ],
+            dim=1,
+        ).repeat_interleave(G, dim=0)
+        frozen_full_inputs_embeds = torch.cat(
+            [frozen_inputs_embeds, rollout_embeds.to(frozen_device)], dim=1
+        )
+
+        chunk_size_frozen = 32
+        frozen_token_log_probs = []
+        for i in range(0, B * G, chunk_size_frozen):
+            frozen_chunked_mask = full_attention_mask.to(frozen_device)[
+                i : i + chunk_size_frozen
+            ]
+            frozen_chunked_full_inputs_embeds = frozen_full_inputs_embeds[
+                i : i + chunk_size_frozen
+            ]
+            frozen_outputs = frozen_model(
+                inputs_embeds=frozen_chunked_full_inputs_embeds,
+                attention_mask=frozen_chunked_mask,
+                use_cache=False,
+            )
+            frozen_logits = frozen_outputs.logits[:, prompt_len - 1 : -1, :]
+            frozen_chunked_log_probs = -F.cross_entropy(
+                frozen_logits.reshape(-1, frozen_logits.size(-1)),
+                rollouts[i : i + chunk_size_frozen].to(frozen_device).view(-1),
+                reduction="none",
+            ).detach()
+            frozen_chunked_log_probs = frozen_chunked_log_probs * not_pad_mask[
+                i : i + chunk_size_frozen
+            ].to(frozen_device).view(-1)
+            frozen_token_log_probs.append(frozen_chunked_log_probs)
+        frozen_token_log_probs = torch.cat(frozen_token_log_probs, dim=0).view(
+            B * G, -1
+        )
+
         chunk_size = 16
         old_token_log_probs_list = []
         for i in range(0, B * G, chunk_size):
@@ -413,8 +461,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 attention_mask=full_mask,
                 use_cache=False,
             ).last_hidden_state
-            prompt_len = input_embeds_this_batch.shape[1]
-            # this skips over the prompt before applying the lm_head
+            # skip over the prompt before applying the lm_head
             # as prompt tokens are ignored anyways
             generated_av_outputs = av_outputs[:, prompt_len - 1 : -1, :].contiguous()
             logits = av_model.lm_head(generated_av_outputs)
@@ -428,29 +475,15 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 -1,
             )  # [B*G, seq_len]
 
-            with torch.no_grad():
-                frozen_model_outputs = frozen_model(
-                    inputs_embeds=full_embeds.detach().to(frozen_device),
-                    attention_mask=full_mask.to(frozen_device),
-                    use_cache=False,
-                )
-
             num_steps = B // mini_batch_size_av
             sliced_advantages = advantages[k * G : k * G + G * mini_batch_size_av]
             sliced_old_token_log_probs = old_token_log_probs[
                 k * G : k * G + G * mini_batch_size_av
             ]
-            with torch.no_grad():
-                frozen_logits = frozen_model_outputs.logits[:, prompt_len - 1 : -1, :]
-                frozen_chosen_log_probs = -F.cross_entropy(
-                    frozen_logits.reshape(-1, frozen_logits.size(-1)),
-                    token_ids.to(frozen_device).squeeze(-1).view(-1),
-                    reduction="none",
-                ).view(
-                    mini_batch_size_av * G,
-                    -1,
-                )  # [G, seq_len]
 
+            sliced_frozen_token_log_probs = frozen_token_log_probs[
+                k * G : k * G + G * mini_batch_size_av
+            ]
             # mask out padding tokens
             chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
             # per-token PPO clipping
@@ -466,9 +499,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
 
             # using Schulman's K3 approximation: http://joschu.net/blog/kl-approx.html
             log_r = torch.clamp(
-                frozen_chosen_log_probs - chosen_token_log_probs.to(frozen_device),
-                min=-5,
-                max=5,
+                sliced_frozen_token_log_probs
+                - chosen_token_log_probs.to(frozen_device),
+                min=-10,
+                max=10,
             )
             kl_approx = torch.exp(log_r) - 1 - log_r
             kl_approx = kl_approx.to(av_device)  # [G, seq_len]
@@ -633,7 +667,6 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     raw_reward = -mse_tensor - COSINE_WEIGHT * cos_loss
                     r = (raw_reward - raw_reward.mean()) / (raw_reward.std() + 1e-8)
                     r = r.detach()
-                    prompt_len = input_embeds_this_batch.shape[1]
                     generated_av_outputs = av_outputs[
                         :, prompt_len - 1 : -1, :
                     ].contiguous()
@@ -664,13 +697,13 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     frozen_logits = frozen_model_outputs.logits[
                         :, prompt_len - 1 : -1, :
                     ]
-                    frozen_chosen_log_probs = -F.cross_entropy(
+                    sliced_frozen_token_log_probs = -F.cross_entropy(
                         frozen_logits.reshape(-1, frozen_logits.size(-1)),
                         token_ids.to(frozen_device).squeeze(-1).view(-1),
                         reduction="none",
                     ).view(G, -1)
                     log_r = torch.clamp(
-                        frozen_chosen_log_probs
+                        sliced_frozen_token_log_probs
                         - chosen_token_log_probs.to(frozen_device),
                         min=-5,
                         max=5,
