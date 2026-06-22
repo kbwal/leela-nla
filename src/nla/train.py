@@ -29,9 +29,9 @@ G = 8
 B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
-LR = 1e-5
+LR = 1e-6
 EPS = 0.2
-PPO_STEPS = 4
+PPO_STEPS = 1
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -50,8 +50,8 @@ config = {
 
 PROJECT_NAME = "nla-train-2-ppo"
 
-# wandb.login()
-# wandb.init(project="lc0-nla", name=PROJECT_NAME, config=config)
+wandb.login()
+wandb.init(project="lc0-nla", name=PROJECT_NAME, config=config)
 
 
 class LeelaActivationDataset(Dataset):
@@ -229,6 +229,7 @@ end_event = torch.cuda.Event(enable_timing=True)
 
 for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1)):
     start_event.record()
+    av_model.eval()
     with torch.no_grad():
         token_embeddings = av_model.get_input_embeddings()
         before_embeds = token_embeddings(prompt_input_ids[:, :activation_pos])
@@ -335,6 +336,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             old_token_log_probs_list.append(chunk_log_probs.detach())
         old_token_log_probs = torch.cat(old_token_log_probs_list, dim=0).view(B * G, -1)
         old_token_log_probs = old_token_log_probs * not_pad_mask
+    av_model.train()
     end_event.record()
     torch.cuda.synchronize()
     print(
@@ -389,6 +391,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         ar_loss_this_mini_batch = (mse_tensor + COSINE_WEIGHT * cos_loss).mean()
         (ar_loss_this_mini_batch / num_steps).backward()
         ar_loss += ar_loss_this_mini_batch.detach() / num_steps
+        train_mse += mse_tensor.mean().detach() / num_steps
+        train_cosine += cos_loss.mean().detach() / num_steps
         rewards.append(-(mse_tensor + COSINE_WEIGHT * cos_loss).detach())
     ar_grad_norm = torch.nn.utils.clip_grad_norm_(
         list(ar_projectors.parameters()) + list(ar_model.parameters()),
@@ -411,7 +415,9 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
     advantages = r.view(-1).detach().to(av_device)  # [B * G]
 
     start_event.record()
+    av_grad_norm_tensor = torch.tensor(0.0, device=av_device)
 
+    # at PPO_STEPS = 1, this is basically just reinforce, but at least it's now easily tunable :-)
     for ppo_step in range(PPO_STEPS):
         av_optimizer.zero_grad()
 
@@ -518,6 +524,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             )
             (av_loss_this_mini_batch / num_steps).backward()
             av_loss += av_loss_this_mini_batch.detach() / num_steps
+        av_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(av_projectors.parameters()) + list(av_model.parameters()), max_norm=1.0
+        )
+        av_grad_norm_tensor += av_grad_norm
         av_optimizer.step()
     av_scheduler.step()
 
@@ -528,24 +538,24 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         start_event.elapsed_time(end_event) / 1000,
     )
 
-    # if batch_idx % 5 == 0:
-    #     is_eval_step = batch_idx > 0 and batch_idx % EVAL_EVERY == 0
-    #     wandb.log(
-    #         {
-    #             "train/av_loss": av_loss.item(),
-    #             "train/ar_loss": ar_loss.item(),
-    #             "train/kl_div_mean": train_kl_div.item(),
-    #             "train/mse_term": train_mse.item(),
-    #             "train/cosine_term": train_cosine.item(),
-    #             "train/av_grad_norm": av_grad_norm.item(),
-    #             "train/ar_grad_norm": ar_grad_norm.item(),
-    #             "train/av_lr": av_optimizer.param_groups[0]["lr"],
-    #             "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
-    #             "iteration": batch_idx,
-    #         },
-    #         step=batch_idx,
-    #         commit=not is_eval_step,
-    #     )
+    if batch_idx % 5 == 0:
+        is_eval_step = batch_idx > 0 and batch_idx % EVAL_EVERY == 0
+        wandb.log(
+            {
+                "train/av_loss": av_loss.item(),
+                "train/ar_loss": ar_loss.item(),
+                "train/kl_div_mean": train_kl_div.item(),
+                "train/mse_term": train_mse.item(),
+                "train/cosine_term": train_cosine.item(),
+                "train/av_grad_norm": av_grad_norm_tensor.item(),
+                "train/ar_grad_norm": ar_grad_norm.item(),
+                "train/av_lr": av_optimizer.param_groups[0]["lr"],
+                "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
+                "iteration": batch_idx,
+            },
+            step=batch_idx,
+            commit=not is_eval_step,
+        )
 
     ar_test_loss = torch.tensor(0.0, device=ar_device)
     av_test_loss = torch.tensor(0.0, device=av_device)
