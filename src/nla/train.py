@@ -32,7 +32,7 @@ G = 8
 B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
-LR = 4e-6
+LR = 3e-6
 EPS = 0.2
 PPO_STEPS = 1
 MAX_CHECKPOINTS = 3
@@ -52,7 +52,7 @@ config = {
 }
 
 PROJECT_NAME = "nla-train-2-ppo"
-PROD = False
+PROD = True
 
 if PROD:
     wandb.login()
@@ -250,6 +250,34 @@ av_projectors_2.train()
 ar_projectors.train()
 
 
+def run_av_generate(av_model, inputs_embeds, attention_mask, device):
+    with torch.cuda.device(device):
+        with torch.no_grad():
+            rollouts = av_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=200,
+                pad_token_id=av_tokenizer.pad_token_id,
+                eos_token_id=av_tokenizer.eos_token_id,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.9,
+                use_cache=True,
+            )
+            return rollouts
+
+
+def run_av_fwd(av_model, inputs_embeds, attention_mask, device):
+    with torch.cuda.device(device):
+        with torch.no_grad():
+            outputs = av_model.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            return outputs
+
+
 def run_av_ppo(
     k_start,
     k_end,
@@ -422,28 +450,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             rollouts = executor.submit(
-                av_model.generate,  # type: ignore
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                max_new_tokens=200,
-                pad_token_id=av_tokenizer.pad_token_id,
-                eos_token_id=av_tokenizer.eos_token_id,
-                do_sample=True,
-                temperature=1.0,
-                top_p=0.9,
-                use_cache=True,
+                run_av_generate, av_model, inputs_embeds, attention_mask, 0
             )
             rollouts_2 = executor.submit(
-                av_model_2.generate,  # type: ignore
-                inputs_embeds=inputs_embeds_2,
-                attention_mask=attention_mask_2,
-                max_new_tokens=200,
-                pad_token_id=av_tokenizer.pad_token_id,
-                eos_token_id=av_tokenizer.eos_token_id,
-                do_sample=True,
-                temperature=1.0,
-                top_p=0.9,
-                use_cache=True,
+                run_av_generate, av_model_2, inputs_embeds_2, attention_mask_2, 3
             )
             rollouts = rollouts.result()
             rollouts_2 = rollouts_2.result()
@@ -456,21 +466,33 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             elif diff < 0:
                 rollouts = F.pad(rollouts, (0, -diff), value=av_tokenizer.pad_token_id)
 
-            rollouts = torch.cat((rollouts, rollouts_2.to(av_device)), dim=0)
-
         not_pad_mask = (rollouts != av_tokenizer.pad_token_id).long()
+        not_pad_mask_2 = (rollouts_2 != av_tokenizer.pad_token_id).long()
         rollout_embeds = token_embeddings(rollouts)
-        inputs_embeds = torch.cat((inputs_embeds, inputs_embeds_2.to(av_device)), dim=0)
-        attention_mask = torch.cat(
-            (attention_mask, attention_mask_2.to(av_device)), dim=0
-        )
+        rollout_embeds_2 = token_embeddings_2(rollouts_2)
+
         full_inputs_embeds = torch.cat([inputs_embeds, rollout_embeds], dim=1)
+        full_inputs_embeds_2 = torch.cat([inputs_embeds_2, rollout_embeds_2], dim=1)
         full_attention_mask = torch.cat([attention_mask, not_pad_mask], dim=1)
-        av_outputs = av_model.model(
-            inputs_embeds=full_inputs_embeds,
-            attention_mask=full_attention_mask,
-            use_cache=False,
-        ).last_hidden_state
+        full_attention_mask_2 = torch.cat([attention_mask_2, not_pad_mask_2], dim=1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            av_outputs = executor.submit(
+                run_av_fwd, av_model, full_inputs_embeds, full_attention_mask, 0
+            )
+            av_outputs_2 = executor.submit(
+                run_av_fwd, av_model_2, full_inputs_embeds_2, full_attention_mask_2, 3
+            )
+            av_outputs = av_outputs.result().last_hidden_state
+            av_outputs_2 = av_outputs_2.result().last_hidden_state
+
+        rollouts = torch.cat((rollouts, rollouts_2.to(av_device)), dim=0)
+        av_outputs = torch.cat((av_outputs, av_outputs_2.to(av_device)), dim=0)
+        full_attention_mask = torch.cat(
+            (full_attention_mask, full_attention_mask_2.to(av_device)), dim=0
+        )
+        not_pad_mask = torch.cat((not_pad_mask, not_pad_mask_2.to(av_device)), dim=0)
+
         prompt_len = inputs_embeds.shape[1]
         generated_old_outputs = (
             av_outputs[:, prompt_len - 1 : -1, :].detach().contiguous()
