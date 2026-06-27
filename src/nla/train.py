@@ -29,7 +29,7 @@ G = 8
 B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
-LR = 1e-6
+LR = 3e-6
 EPS = 0.2
 PPO_STEPS = 1
 MAX_CHECKPOINTS = 3
@@ -49,9 +49,11 @@ config = {
 }
 
 PROJECT_NAME = "nla-train-2-ppo"
+prod = False
 
-wandb.login()
-wandb.init(project="lc0-nla", name=PROJECT_NAME, config=config)
+if prod:
+    wandb.login()
+    wandb.init(project="lc0-nla", name=PROJECT_NAME, config=config)
 
 
 class LeelaActivationDataset(Dataset):
@@ -82,7 +84,7 @@ class LeelaActivationDataset(Dataset):
 
     def __getitem__(self, index):
         return torch.load(
-            self.activation_paths[index], map_location=self.device, weights_only=False
+            self.activation_paths[index], map_location="cpu", weights_only=False
         ).to(torch.bfloat16)
 
 
@@ -162,6 +164,7 @@ ar_model = AutoModel.from_pretrained(
     dtype=torch.bfloat16,
     device_map=ar_device,
     trust_remote_code=True,
+    # attn_implementation="flash_attention_2",
 )
 ar_model.config.pad_token_id = ar_tokenizer.pad_token_id
 # ar_model.gradient_checkpointing_enable()
@@ -202,20 +205,24 @@ train_dataloader = DataLoader(
     batch_size=B,
     shuffle=True,
     drop_last=True,
+    num_workers=8,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
 )
 
 av_scheduler = get_cosine_schedule_with_warmup(
     optimizer=av_optimizer,
-    num_warmup_steps=int(len(train_dataloader) * 0.1),
+    num_warmup_steps=int(len(train_dataloader) * 0.05),
     num_training_steps=len(train_dataloader),
 )
 ar_scheduler = get_cosine_schedule_with_warmup(
     optimizer=ar_optimizer,
-    num_warmup_steps=int(len(train_dataloader) * 0.1),
+    num_warmup_steps=int(len(train_dataloader) * 0.05),
     num_training_steps=len(train_dataloader),
 )
 
-# av_model = torch.compile(av_model, dynamic=True)
+av_model = torch.compile(av_model, dynamic=True)
 ar_model = torch.compile(ar_model, dynamic=True)
 frozen_model = torch.compile(frozen_model, dynamic=True)
 
@@ -228,7 +235,8 @@ start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 
 for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1)):
-    start_event.record()
+    leela_activations = leela_activations.to(av_device, non_blocking=True)
+    # start_event.record()
     av_model.eval()
     with torch.no_grad():
         token_embeddings = av_model.get_input_embeddings()
@@ -337,12 +345,12 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         old_token_log_probs = torch.cat(old_token_log_probs_list, dim=0).view(B * G, -1)
         old_token_log_probs = old_token_log_probs * not_pad_mask
     av_model.train()
-    end_event.record()
-    torch.cuda.synchronize()
-    print(
-        "time for rollouts + old log probs: ",
-        start_event.elapsed_time(end_event) / 1000,
-    )
+    # end_event.record()
+    # torch.cuda.synchronize()
+    # print(
+    #     "time for rollouts + old log probs: ",
+    #     start_event.elapsed_time(end_event) / 1000,
+    # )
 
     ar_optimizer.zero_grad()
     av_optimizer.zero_grad()
@@ -356,16 +364,22 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
     mini_batch_size_ar = 2
     rewards = []
 
-    start_event.record()
+    # start_event.record()
     for k in range(0, B, mini_batch_size_ar):
-        sliced_rollouts = rollouts[k * G : k * G + G * mini_batch_size_ar].to(ar_device)
+        sliced_rollouts = (
+            rollouts[k * G : k * G + G * mini_batch_size_ar].to(ar_device).contiguous()
+        )
         generated_attention_mask = (
-            (sliced_rollouts != av_tokenizer.pad_token_id).long().to(ar_device)
+            (sliced_rollouts != av_tokenizer.pad_token_id)
+            .long()
+            .to(ar_device)
+            .contiguous()
         )
         sliced_leela_activations = (
             leela_activations[k : k + mini_batch_size_ar]
             .repeat_interleave(G, dim=0)
             .to(ar_device)
+            .contiguous()
         )
         reconstructed = ar_model(
             input_ids=sliced_rollouts,
@@ -393,7 +407,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         ar_loss += ar_loss_this_mini_batch.detach() / num_steps
         train_mse += mse_tensor.mean().detach() / num_steps
         train_cosine += cos_loss.mean().detach() / num_steps
-        rewards.append(-(mse_tensor + COSINE_WEIGHT * cos_loss).detach())
+        mini_batch_rewards = -(mse_tensor + COSINE_WEIGHT * cos_loss).detach()
+        rewards.append(mini_batch_rewards)
     ar_grad_norm = torch.nn.utils.clip_grad_norm_(
         list(ar_projectors.parameters()) + list(ar_model.parameters()),
         max_norm=1.0,
@@ -401,20 +416,21 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
     ar_optimizer.step()
     ar_scheduler.step()
 
-    end_event.record()
-    torch.cuda.synchronize()
-    print(
-        "time for ar step: ",
-        start_event.elapsed_time(end_event) / 1000,
-    )
+    # end_event.record()
+    # torch.cuda.synchronize()
+    # print(
+    #     "time for ar step: ",
+    #     start_event.elapsed_time(end_event) / 1000,
+    # )
 
     r = torch.cat(rewards)
     r = r.view(B, G)
+    r_std = r.std(dim=1).mean()
     r = (r - r.mean(dim=1, keepdim=True)) / (r.std(dim=1, keepdim=True) + 1e-8)
     r = r.view(B * G)
     advantages = r.view(-1).detach().to(av_device)  # [B * G]
 
-    start_event.record()
+    # start_event.record()
     av_grad_norm_tensor = torch.tensor(0.0, device=av_device)
 
     # at PPO_STEPS = 1, this is basically just reinforce, but at least it's now easily tunable :-)
@@ -422,11 +438,17 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         av_optimizer.zero_grad()
 
         for k in range(0, B, mini_batch_size_av):
-            sliced_rollouts = rollouts[k * G : k * G + G * mini_batch_size_av]
+            num_steps = B // mini_batch_size_av
+
+            sliced_rollouts = rollouts[
+                k * G : k * G + G * mini_batch_size_av
+            ].contiguous()
             generated_attention_mask = (
-                sliced_rollouts != av_tokenizer.pad_token_id
-            ).long()
-            sliced_leela_activations = leela_activations[k : k + mini_batch_size_av]
+                (sliced_rollouts != av_tokenizer.pad_token_id).long().contiguous()
+            )
+            sliced_leela_activations = leela_activations[
+                k : k + mini_batch_size_av
+            ].contiguous()
             before_mask = prompt_attention_mask[:, :activation_pos].expand(
                 mini_batch_size_av, -1
             )
@@ -481,18 +503,13 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 -1,
             )  # [B*G, seq_len]
 
-            num_steps = B // mini_batch_size_av
             sliced_advantages = advantages[k * G : k * G + G * mini_batch_size_av]
-            sliced_old_token_log_probs = old_token_log_probs[
-                k * G : k * G + G * mini_batch_size_av
-            ]
-
-            sliced_frozen_token_log_probs = frozen_token_log_probs[
-                k * G : k * G + G * mini_batch_size_av
-            ]
             # mask out padding tokens
             chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
             # per-token PPO clipping
+            sliced_old_token_log_probs = old_token_log_probs[
+                k * G : k * G + G * mini_batch_size_av
+            ]
             token_ratio = torch.exp(chosen_token_log_probs - sliced_old_token_log_probs)
             # sliced_advantages is [mini_batch_size*G], broadcast to [mini_batch_size*G, seq_len] for per-token clipping
             sliced_advantages = sliced_advantages.unsqueeze(-1)
@@ -503,6 +520,9 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             valid_tokens = generated_attention_mask.sum(dim=-1).clamp_min(1)
             policy_loss = -(clipped_obj.sum(dim=-1) / valid_tokens).mean()
 
+            sliced_frozen_token_log_probs = frozen_token_log_probs[
+                k * G : k * G + G * mini_batch_size_av
+            ]
             # using Schulman's K3 approximation: http://joschu.net/blog/kl-approx.html
             log_r = torch.clamp(
                 sliced_frozen_token_log_probs
@@ -531,14 +551,14 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         av_optimizer.step()
     av_scheduler.step()
 
-    end_event.record()
-    torch.cuda.synchronize()
-    print(
-        "time for av all PPO steps: ",
-        start_event.elapsed_time(end_event) / 1000,
-    )
+    # end_event.record()
+    # torch.cuda.synchronize()
+    # print(
+    #     "time for av all PPO steps: ",
+    #     start_event.elapsed_time(end_event) / 1000,
+    # )
 
-    if batch_idx % 5 == 0:
+    if batch_idx % 5 == 0 and prod:
         is_eval_step = batch_idx > 0 and batch_idx % EVAL_EVERY == 0
         wandb.log(
             {
@@ -551,6 +571,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 "train/ar_grad_norm": ar_grad_norm.item(),
                 "train/av_lr": av_optimizer.param_groups[0]["lr"],
                 "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
+                "train/r_std": r_std.item(),
                 "iteration": batch_idx,
             },
             step=batch_idx,
