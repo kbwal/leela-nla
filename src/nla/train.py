@@ -49,7 +49,7 @@ config = {
 }
 
 PROJECT_NAME = "nla-train-2-ppo"
-prod = False
+prod = True
 
 if prod:
     wandb.login()
@@ -164,7 +164,7 @@ ar_model = AutoModel.from_pretrained(
     dtype=torch.bfloat16,
     device_map=ar_device,
     trust_remote_code=True,
-    # attn_implementation="flash_attention_2",
+    attn_implementation="flash_attention_2",
 )
 ar_model.config.pad_token_id = ar_tokenizer.pad_token_id
 # ar_model.gradient_checkpointing_enable()
@@ -590,6 +590,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             dataset=test_dataset, batch_size=B, shuffle=True, drop_last=True
         )
         for test_batch_idx, leela_test_activations in enumerate(tqdm(test_dl)):
+            leela_test_activations = leela_test_activations.to(av_device)
             if test_batch_idx >= max_test_batches:
                 ar_model.train()
                 av_model.train()
