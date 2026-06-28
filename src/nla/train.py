@@ -346,6 +346,11 @@ def run_ar_update(
     ar_loss = torch.tensor(0.0, device=ar_device)
     train_mse = torch.tensor(0.0, device=ar_device)
     train_cosine = torch.tensor(0.0, device=ar_device)
+    residual_sse = torch.tensor(0.0, device=ar_device, dtype=torch.float32)
+    variance_sse = torch.tensor(0.0, device=ar_device, dtype=torch.float32)
+    batch_activation_mean = leela_activations.to(ar_device, dtype=torch.float32).mean(
+        dim=0, keepdim=True
+    )
     for k in range(0, B, mini_batch_size_ar):
         sliced_rollouts = (
             rollouts[k * G : k * G + G * mini_batch_size_ar].to(ar_device).contiguous()
@@ -388,9 +393,17 @@ def run_ar_update(
         ar_loss += ar_loss_this_mini_batch.detach() / num_steps
         train_mse += mse_tensor.mean().detach() / num_steps
         train_cosine += cos_loss.mean().detach() / num_steps
+        residual_sse += (
+            (reconstructed_vector.detach().float() - sliced_leela_activations.float())
+            ** 2
+        ).sum()
+        variance_sse += (
+            (sliced_leela_activations.float() - batch_activation_mean) ** 2
+        ).sum()
         mini_batch_rewards = -(mse_tensor + COSINE_WEIGHT * cos_loss).detach()
         rewards.append(mini_batch_rewards)
-    return rewards, ar_loss, train_mse, train_cosine
+    train_fve = 1 - residual_sse / variance_sse
+    return rewards, ar_loss, train_mse, train_cosine, train_fve
 
 
 def run_av_ppo(
@@ -666,7 +679,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         )
         frozen_token_log_probs = frozen_token_log_probs.result()
         old_token_log_probs = old_token_log_probs.result()
-        rewards, ar_loss, train_mse, train_cosine = ar_update_call.result()
+        rewards, ar_loss, train_mse, train_cosine, train_fve = ar_update_call.result()
     ar_grad_norm = torch.nn.utils.clip_grad_norm_(
         list(ar_projectors.parameters()) + list(ar_model.parameters()),
         max_norm=1.0,
@@ -759,6 +772,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 "train/kl_div_mean": train_kl_div.item(),
                 "train/mse_term": train_mse.item(),
                 "train/cosine_term": train_cosine.item(),
+                "train/fve": train_fve.item(),
                 "train/av_grad_norm": av_grad_norm_tensor.item(),
                 "train/ar_grad_norm": ar_grad_norm.item(),
                 "train/av_lr": av_optimizer.param_groups[0]["lr"],
@@ -768,6 +782,33 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             },
             step=batch_idx,
             commit=not is_eval_step,
+        )
+    elif batch_idx % 5 == 0 and not PROD:
+        print(
+            "train/av_loss: ",
+            av_loss.item(),
+            "train/ar_loss: ",
+            ar_loss.item(),
+            "train/kl_div_mean: ",
+            train_kl_div.item(),
+            "train/mse_term: ",
+            train_mse.item(),
+            "train/cosine_term: ",
+            train_cosine.item(),
+            "train/fve: ",
+            train_fve.item(),
+            "train/av_grad_norm: ",
+            av_grad_norm_tensor.item(),
+            "train/ar_grad_norm: ",
+            ar_grad_norm.item(),
+            "train/av_lr: ",
+            av_optimizer.param_groups[0]["lr"],
+            "train/ar_lr: ",
+            ar_optimizer.param_groups[0]["lr"],
+            "train/r_std: ",
+            r_std.item(),
+            "iteration: ",
+            batch_idx,
         )
 
     ar_test_loss = torch.tensor(0.0, device=ar_device)
