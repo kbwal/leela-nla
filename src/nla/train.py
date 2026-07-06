@@ -23,6 +23,7 @@ import concurrent.futures
 import queue
 
 torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 av_checkpoint_dir = "../../outputs/warm_start/qwen3.5-2b-nla-av/final"
 ar_checkpoint_dir = "../../outputs/warm_start/qwen3.5-2b-nla-ar/final"
@@ -237,10 +238,10 @@ ar_scheduler = get_cosine_schedule_with_warmup(
     num_training_steps=len(train_dataloader),
 )
 
-av_model = torch.compile(av_model)
-av_model_2 = torch.compile(av_model_2)
-ar_model = torch.compile(ar_model)
-frozen_model = torch.compile(frozen_model)
+# av_model = torch.compile(av_model)
+# av_model_2 = torch.compile(av_model_2)
+# ar_model = torch.compile(ar_model)
+# frozen_model = torch.compile(frozen_model)
 
 av_model.train()
 av_model_2.train()
@@ -256,7 +257,7 @@ ready_queue = queue.Queue()
 
 def run_av_generate(av_model, inputs_embeds, attention_mask, device):
     with torch.cuda.device(device):
-        with torch.no_grad():
+        with torch.inference_mode():
             rollouts = av_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -573,11 +574,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             rollouts = rollouts.result()
             rollouts_2 = rollouts_2.result()
 
-            d1 = 200 - rollouts.shape[1]
-            d2 = 200 - rollouts_2.shape[1]
-            rollouts = F.pad(rollouts, (0, d1), value=av_tokenizer.pad_token_id)
-            rollouts_2 = F.pad(rollouts_2, (0, d2), value=av_tokenizer.pad_token_id)
-
+        d1 = 200 - rollouts.shape[1]
+        d2 = 200 - rollouts_2.shape[1]
+        rollouts = F.pad(rollouts, (0, d1), value=av_tokenizer.pad_token_id)
+        rollouts_2 = F.pad(rollouts_2, (0, d2), value=av_tokenizer.pad_token_id)
         not_pad_mask = (rollouts != av_tokenizer.pad_token_id).long()
         not_pad_mask_2 = (rollouts_2 != av_tokenizer.pad_token_id).long()
         full_attention_mask = torch.cat([attention_mask, not_pad_mask], dim=1)
@@ -759,7 +759,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         test_dl = DataLoader(
             dataset=test_dataset, batch_size=B, shuffle=True, drop_last=True
         )
-        for test_batch_idx, leela_test_activations in enumerate(tqdm(test_dl)):
+        for test_batch_idx, leela_test_activations in enumerate(test_dl):
             leela_test_activations = leela_test_activations.to(av_device)
             if test_batch_idx >= max_test_batches:
                 ar_model.train()
