@@ -37,7 +37,7 @@ COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
 TEMPERATURE = 1.0
-MAX_TOKENS = 190
+MAX_TOKENS = 185
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -49,6 +49,7 @@ config = {
     "cosine_weight": COSINE_WEIGHT,
     "kl_weight": KL_WEIGHT,
     "rollout_temperature": TEMPERATURE,
+    "max_tokens": MAX_TOKENS,
     "eval_every": EVAL_EVERY,
     "checkpoint_every": CHECKPOINT_EVERY,
 }
