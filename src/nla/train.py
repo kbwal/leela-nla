@@ -36,7 +36,6 @@ B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
-EPS = 0.2
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -49,7 +48,6 @@ config = {
     "kl_weight": KL_WEIGHT,
     "eval_every": EVAL_EVERY,
     "checkpoint_every": CHECKPOINT_EVERY,
-    "eps": EPS,
 }
 
 PROJECT_NAME = "nla-train-3-queued-rewards"
@@ -282,6 +280,7 @@ def run_frozen_log_probs(
     prompt_len,
     frozen_device,
 ):
+    torch.cuda.set_device(frozen_device)
     with torch.no_grad():
         frozen_token_log_probs = []
         for i in range(0, B * G, chunk_size_frozen):
@@ -291,20 +290,29 @@ def run_frozen_log_probs(
             frozen_chunked_full_inputs_embeds = frozen_full_inputs_embeds[
                 i : i + chunk_size_frozen
             ]
-            frozen_outputs = frozen_model(
-                inputs_embeds=frozen_chunked_full_inputs_embeds,
-                attention_mask=frozen_chunked_mask,
-                use_cache=False,
+            frozen_hidden_states = (
+                frozen_model.model(
+                    inputs_embeds=frozen_chunked_full_inputs_embeds,
+                    attention_mask=frozen_chunked_mask,
+                    use_cache=False,
+                )
+                .last_hidden_state[:, prompt_len - 1 : -1, :]
+                .contiguous()
             )
-            frozen_logits = frozen_outputs.logits[:, prompt_len - 1 : -1, :]
-            frozen_chunked_log_probs = -F.cross_entropy(
-                frozen_logits.reshape(-1, frozen_logits.size(-1)),
-                rollouts[i : i + chunk_size_frozen].to(frozen_device).view(-1),
-                reduction="none",
-            ).detach()
+            frozen_targets = rollouts[i : i + chunk_size_frozen].to(frozen_device)
+            frozen_logits = frozen_model.lm_head(frozen_hidden_states)
+            frozen_chunked_log_probs = (
+                -F.cross_entropy(
+                    frozen_logits.reshape(-1, frozen_logits.size(-1)),
+                    frozen_targets.view(-1),
+                    reduction="none",
+                )
+                .view(frozen_targets.shape)
+                .detach()
+            )
             frozen_chunked_log_probs = frozen_chunked_log_probs * not_pad_mask[
                 i : i + chunk_size_frozen
-            ].to(frozen_device).view(-1)
+            ].to(frozen_device)
             frozen_token_log_probs.append(frozen_chunked_log_probs)
             frozen_chunked_log_probs = frozen_chunked_log_probs.view(
                 chunk_size_frozen // G, G, -1
@@ -400,7 +408,7 @@ def create_ready_queue(mini_batch_size_av):
     ready_queue.put(None)
 
 
-def run_av_ppo(
+def run_av_update(
     device,
     av_model,
     av_projectors,
@@ -410,6 +418,7 @@ def run_av_ppo(
     leela_activations,
     prompt_len,
 ):
+    torch.cuda.set_device(device)
     local_av_loss = torch.tensor(0.0, device=device)
     local_kl_div = torch.tensor(0.0, device=device)
 
@@ -506,8 +515,8 @@ def run_av_ppo(
         ).to(device)
         log_r = torch.clamp(
             sliced_frozen_token_log_probs - chosen_token_log_probs,
-            min=-10,
-            max=10,
+            min=-5,
+            max=5,
         )
         kl_approx = torch.exp(log_r) - 1 - log_r
         kl_approx = kl_approx.to(device)
@@ -591,19 +600,26 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
 
         prompt_len = inputs_embeds.shape[1]
 
+        frozen_token_embeddings = frozen_model.get_input_embeddings()
+        frozen_before_embeds = frozen_token_embeddings(
+            prompt_input_ids[:, :activation_pos].to(frozen_device)
+        ).expand(B, -1, -1)
+        frozen_after_embeds = frozen_token_embeddings(
+            prompt_input_ids[:, activation_pos + 1 :].to(frozen_device)
+        ).expand(B, -1, -1)
         frozen_embeds = frozen_projectors(leela_activations.to(frozen_device))
         frozen_inputs_embeds = torch.cat(
             [
-                batch_before_embeds.to(frozen_device),
+                frozen_before_embeds,
                 frozen_embeds,
-                batch_after_embeds.to(frozen_device),
+                frozen_after_embeds,
             ],
             dim=1,
         ).repeat_interleave(G, dim=0)
         frozen_full_inputs_embeds = torch.cat(
             [
                 frozen_inputs_embeds,
-                frozen_model.get_input_embeddings()(rollouts.to(frozen_device)),
+                frozen_token_embeddings(rollouts.to(frozen_device)),
             ],
             dim=1,
         )
@@ -648,7 +664,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         )
         ready_queue_call = executor.submit(create_ready_queue, mini_batch_size_av)
         f1 = executor.submit(
-            run_av_ppo,
+            run_av_update,
             device=av_device,
             av_model=av_model,
             av_projectors=av_projectors,
@@ -656,7 +672,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             **common_kwargs,
         )
         f2 = executor.submit(
-            run_av_ppo,
+            run_av_update,
             device=av_device_2,
             av_model=av_model_2,
             av_projectors=av_projectors_2,
@@ -793,6 +809,24 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 )
                 inputs_embeds = inputs_embeds.repeat_interleave(G, dim=0)
                 attention_mask = attention_mask.repeat_interleave(G, dim=0)
+                frozen_token_embeddings = frozen_model.get_input_embeddings()
+                frozen_before_embeds = frozen_token_embeddings(
+                    prompt_input_ids[:, :activation_pos].to(frozen_device)
+                ).expand(B, -1, -1)
+                frozen_after_embeds = frozen_token_embeddings(
+                    prompt_input_ids[:, activation_pos + 1 :].to(frozen_device)
+                ).expand(B, -1, -1)
+                frozen_av_embeds = frozen_projectors(
+                    leela_test_activations.to(frozen_device)
+                )
+                frozen_inputs_embeds = torch.cat(
+                    [
+                        frozen_before_embeds,
+                        frozen_av_embeds,
+                        frozen_after_embeds,
+                    ],
+                    dim=1,
+                ).repeat_interleave(G, dim=0)
                 rollouts = av_model.generate(  # type: ignore
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -838,8 +872,16 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                         attention_mask=full_mask,
                         use_cache=False,
                     ).last_hidden_state
-                    frozen_model_outputs = frozen_model(
-                        inputs_embeds=full_embeds.detach().to(frozen_device),
+                    frozen_model_outputs = frozen_model.model(
+                        inputs_embeds=torch.cat(
+                            [
+                                frozen_inputs_embeds[k * G : k * G + G],
+                                frozen_token_embeddings(
+                                    sliced_rollouts.to(frozen_device)
+                                ),
+                            ],
+                            dim=1,
+                        ),
                         attention_mask=full_mask.to(frozen_device),
                         use_cache=False,
                     )
@@ -872,13 +914,13 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     generated_av_outputs = av_outputs[
                         :, prompt_len - 1 : -1, :
                     ].contiguous()
-                    logits = av_model.lm_head(generated_av_outputs)
-                    token_ids = sliced_rollouts.unsqueeze(-1)
+                    eval_av_logits = av_model.lm_head(generated_av_outputs)
                     chosen_token_log_probs = -F.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)),
-                        token_ids.squeeze(-1).view(-1),
+                        eval_av_logits.flatten(0, 1),
+                        sliced_rollouts.flatten(),
                         reduction="none",
-                    ).view(G, -1)
+                    ).view(sliced_rollouts.shape)
+                    del eval_av_logits
                     chosen_token_log_probs = (
                         chosen_token_log_probs * generated_attention_mask
                     )
@@ -887,8 +929,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     token_ratio = torch.ones_like(chosen_token_log_probs)
                     r_expanded = r.unsqueeze(-1).to(av_device)
                     surr1 = token_ratio * r_expanded
-                    surr2 = torch.clamp(token_ratio, 1 - EPS, 1 + EPS) * r_expanded
-                    clipped_obj = torch.min(surr1, surr2) * generated_attention_mask
+                    clipped_obj = surr1 * generated_attention_mask
                     valid_tokens_per_rollout = generated_attention_mask.sum(
                         dim=-1
                     ).clamp_min(1)
@@ -896,14 +937,17 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                         clipped_obj.sum(dim=-1) / valid_tokens_per_rollout
                     ).mean()
 
-                    frozen_logits = frozen_model_outputs.logits[
+                    frozen_hidden_states = frozen_model_outputs.last_hidden_state[
                         :, prompt_len - 1 : -1, :
-                    ]
-                    sliced_frozen_token_log_probs = -F.cross_entropy(
-                        frozen_logits.reshape(-1, frozen_logits.size(-1)),
-                        token_ids.to(frozen_device).squeeze(-1).view(-1),
-                        reduction="none",
-                    ).view(G, -1)
+                    ].contiguous()
+                    with torch.cuda.device(frozen_device):
+                        eval_frozen_logits = frozen_model.lm_head(frozen_hidden_states)
+                        sliced_frozen_token_log_probs = -F.cross_entropy(
+                            eval_frozen_logits.flatten(0, 1),
+                            sliced_rollouts.to(frozen_device).flatten(),
+                            reduction="none",
+                        ).view(sliced_rollouts.shape)
+                        del eval_frozen_logits
                     log_r = torch.clamp(
                         sliced_frozen_token_log_probs
                         - chosen_token_log_probs.to(frozen_device),
