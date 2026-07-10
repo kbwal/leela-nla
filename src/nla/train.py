@@ -37,7 +37,7 @@ COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
 TEMPERATURE = 1.0
-MAX_TOKENS = 200
+MAX_TOKENS = 190
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -603,7 +603,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         not_pad_mask = torch.cat((not_pad_mask, not_pad_mask_2.to(av_device)), dim=0)
         rollout_lengths = not_pad_mask.sum(dim=1).float()
         avg_rollout_length = rollout_lengths.mean()
-        p90_rollout_length = torch.quantile(rollout_lengths, 0.90)
+        p95_rollout_length = torch.quantile(rollout_lengths, 0.95)
 
         prompt_len = inputs_embeds.shape[1]
 
@@ -741,7 +741,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 "train/r_std": r_std.item(),
                 "train/token_entropy": train_token_entropy.item(),
                 "train/avg_rollout_length": avg_rollout_length.item(),
-                "train/p90_rollout_length": p90_rollout_length.item(),
+                "train/p95_rollout_length": p95_rollout_length.item(),
                 "iteration": batch_idx,
             },
             step=batch_idx,
@@ -775,8 +775,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             train_token_entropy.item(),
             "train/avg_rollout_length: ",
             avg_rollout_length.item(),
-            "train/p90_rollout_length: ",
-            p90_rollout_length.item(),
+            "train/p95_rollout_length: ",
+            p95_rollout_length.item(),
             "iteration: ",
             batch_idx,
         )
