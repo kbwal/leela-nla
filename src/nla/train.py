@@ -36,8 +36,8 @@ B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
-TEMPERATURE = 1.2
-MAX_TOKENS = 180
+TEMPERATURE = 1.0
+MAX_TOKENS = 200
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -53,7 +53,7 @@ config = {
     "checkpoint_every": CHECKPOINT_EVERY,
 }
 
-PROJECT_NAME = "nla-train-4-higher-temperature"
+PROJECT_NAME = "nla-train-4-only-mean-norm"
 PROD = True
 
 if PROD:
@@ -504,9 +504,7 @@ def run_av_update(
             reduction="none",
         ).view(mini_batch_size_av * G, -1)
 
-        sliced_advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (
-            rewards.std(dim=1, keepdim=True) + 1e-8
-        )
+        sliced_advantages = rewards - rewards.mean(dim=1, keepdim=True)
         sliced_advantages = sliced_advantages.view(-1).to(device)
         chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
 
@@ -928,7 +926,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     )
                     ar_test_loss += ar_loss_this_mini_batch.detach() / B
                     raw_reward = -mse_tensor - COSINE_WEIGHT * cos_loss
-                    r = (raw_reward - raw_reward.mean()) / (raw_reward.std() + 1e-8)
+                    r = raw_reward - raw_reward.mean()
                     r = r.detach()
                     generated_av_outputs = av_outputs[
                         :, prompt_len - 1 : -1, :
