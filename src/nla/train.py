@@ -36,6 +36,8 @@ B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
+TEMPERATURE = 1.2
+MAX_TOKENS = 180
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -46,12 +48,13 @@ config = {
     "batch_size": B,
     "cosine_weight": COSINE_WEIGHT,
     "kl_weight": KL_WEIGHT,
+    "rollout_temperature": TEMPERATURE,
     "eval_every": EVAL_EVERY,
     "checkpoint_every": CHECKPOINT_EVERY,
 }
 
-PROJECT_NAME = "nla-train-3-queued-rewards"
-PROD = False
+PROJECT_NAME = "nla-train-4-higher-temperature"
+PROD = True
 
 if PROD:
     wandb.login()
@@ -259,11 +262,11 @@ def run_av_generate(av_model, inputs_embeds, attention_mask, device):
             rollouts = av_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                max_new_tokens=200,
+                max_new_tokens=MAX_TOKENS,
                 pad_token_id=av_tokenizer.pad_token_id,
                 eos_token_id=av_tokenizer.eos_token_id,
                 do_sample=True,
-                temperature=1.0,
+                temperature=TEMPERATURE,
                 top_p=0.9,
                 use_cache=True,
             )
@@ -421,6 +424,7 @@ def run_av_update(
     torch.cuda.set_device(device)
     local_av_loss = torch.tensor(0.0, device=device)
     local_kl_div = torch.tensor(0.0, device=device)
+    local_token_entropy = torch.tensor(0.0, device=device)
 
     while True:
         item = ready_queue.get()
@@ -508,6 +512,7 @@ def run_av_update(
 
         valid_tokens = generated_attention_mask.sum(dim=-1).clamp_min(1)
         log_prob_per_rollout = chosen_token_log_probs.sum(dim=-1) / valid_tokens
+        token_entropy = -log_prob_per_rollout.mean()
         policy_loss = -(log_prob_per_rollout * sliced_advantages).mean()
 
         sliced_frozen_token_log_probs = sliced_frozen_token_log_probs.view(
@@ -530,7 +535,8 @@ def run_av_update(
 
         local_kl_div += kl_div_per_rollout.mean().detach() * mini_batch_size_av / B
         local_av_loss += av_loss_this_mini_batch.detach() * mini_batch_size_av / B
-    return local_av_loss, local_kl_div
+        local_token_entropy += token_entropy.detach() * mini_batch_size_av / B
+    return local_av_loss, local_kl_div, local_token_entropy
 
 
 for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1)):
@@ -583,8 +589,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             rollouts = rollouts.result()
             rollouts_2 = rollouts_2.result()
 
-        d1 = 200 - rollouts.shape[1]
-        d2 = 200 - rollouts_2.shape[1]
+        d1 = MAX_TOKENS - rollouts.shape[1]
+        d2 = MAX_TOKENS - rollouts_2.shape[1]
         rollouts = F.pad(rollouts, (0, d1), value=av_tokenizer.pad_token_id)
         rollouts_2 = F.pad(rollouts_2, (0, d2), value=av_tokenizer.pad_token_id)
         not_pad_mask = (rollouts != av_tokenizer.pad_token_id).long()
@@ -597,6 +603,9 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             (full_attention_mask, full_attention_mask_2.to(av_device)), dim=0
         )
         not_pad_mask = torch.cat((not_pad_mask, not_pad_mask_2.to(av_device)), dim=0)
+        rollout_lengths = not_pad_mask.sum(dim=1).float()
+        avg_rollout_length = rollout_lengths.mean()
+        p90_rollout_length = torch.quantile(rollout_lengths, 0.90)
 
         prompt_len = inputs_embeds.shape[1]
 
@@ -682,10 +691,11 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
         frozen_token_log_probs = frozen_token_log_probs.result()
         rewards, ar_loss, train_mse, train_cosine, train_fve = ar_update_call.result()
         ready_queue_call.result()
-        loss0, kl0 = f1.result()
-        loss1, kl1 = f2.result()
+        loss0, kl0, entropy0 = f1.result()
+        loss1, kl1, entropy1 = f2.result()
     av_loss += loss0.to(av_device) + loss1.to(av_device)
     train_kl_div += kl0.to(av_device) + kl1.to(av_device)
+    train_token_entropy = entropy0.to(av_device) + entropy1.to(av_device)
     ar_grad_norm = torch.nn.utils.clip_grad_norm_(
         list(ar_projectors.parameters()) + list(ar_model.parameters()),
         max_norm=1.0,
@@ -731,6 +741,9 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 "train/av_lr": av_optimizer.param_groups[0]["lr"],
                 "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
                 "train/r_std": r_std.item(),
+                "train/token_entropy": train_token_entropy.item(),
+                "train/avg_rollout_length": avg_rollout_length.item(),
+                "train/p90_rollout_length": p90_rollout_length.item(),
                 "iteration": batch_idx,
             },
             step=batch_idx,
@@ -760,6 +773,12 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             ar_optimizer.param_groups[0]["lr"],
             "train/r_std: ",
             r_std.item(),
+            "train/token_entropy: ",
+            train_token_entropy.item(),
+            "train/avg_rollout_length: ",
+            avg_rollout_length.item(),
+            "train/p90_rollout_length: ",
+            p90_rollout_length.item(),
             "iteration: ",
             batch_idx,
         )
@@ -834,7 +853,7 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     pad_token_id=av_tokenizer.pad_token_id,
                     eos_token_id=av_tokenizer.eos_token_id,
                     do_sample=True,
-                    temperature=1.0,
+                    temperature=TEMPERATURE,
                     top_p=0.9,
                     use_cache=True,
                 )
