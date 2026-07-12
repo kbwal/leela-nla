@@ -15,9 +15,10 @@ import bitsandbytes as bnb
 import wandb
 import os
 import json
+import random
 import shutil
 from pathlib import Path
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 import concurrent.futures
 import queue
@@ -217,12 +218,16 @@ frozen_projectors.requires_grad_(False)
 
 saved_checkpoints = []
 
+# note: when resuming from a checkpoint, use batch_idx + 1
 leela_activation_dataset = LeelaActivationDataset()
+dataset_shuffle_indices = torch.randperm(len(leela_activation_dataset)).tolist()
+n_batches = len(dataset_shuffle_indices) // B  # drop last batch (if not divisible by B)
+dataset_shuffle_indices = dataset_shuffle_indices[: n_batches * B]
 train_dataloader = DataLoader(
-    dataset=leela_activation_dataset,
+    dataset=Subset(leela_activation_dataset, dataset_shuffle_indices),
     batch_size=B,
-    shuffle=True,
-    drop_last=True,
+    shuffle=False,
+    drop_last=False,
     num_workers=8,
     pin_memory=True,
     persistent_workers=True,
@@ -1044,8 +1049,18 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             {
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
+                "python_rng_state": random.getstate(),
             },
             checkpoint_dir / "rng_state.pt",
+        )
+
+        torch.save(
+            {
+                "dataset_shuffle_indices": dataset_shuffle_indices,
+                "batch_idx": batch_idx,
+                "batch_size": B,
+            },
+            checkpoint_dir / "dataloader_state.pt",
         )
 
         with (checkpoint_dir / "train_state.json").open("w") as f:
