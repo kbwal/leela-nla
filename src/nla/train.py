@@ -37,8 +37,9 @@ B = 32
 COSINE_WEIGHT = 0.25
 KL_WEIGHT = 0.25
 LR = 3e-6
+STD_FLOOR = 0.05
 TEMPERATURE = 1.0
-MAX_TOKENS = 185
+MAX_TOKENS = 190
 MAX_CHECKPOINTS = 3
 EVAL_EVERY = 1000
 CHECKPOINT_EVERY = 1000
@@ -49,13 +50,14 @@ config = {
     "batch_size": B,
     "cosine_weight": COSINE_WEIGHT,
     "kl_weight": KL_WEIGHT,
+    "std_floor": STD_FLOOR,
     "rollout_temperature": TEMPERATURE,
     "max_tokens": MAX_TOKENS,
     "eval_every": EVAL_EVERY,
     "checkpoint_every": CHECKPOINT_EVERY,
 }
 
-PROJECT_NAME = "nla-train-4-only-mean-norm"
+PROJECT_NAME = "nla-train-5-std-floor"
 PROD = True
 
 if PROD:
@@ -510,13 +512,17 @@ def run_av_update(
             reduction="none",
         ).view(mini_batch_size_av * G, -1)
 
-        sliced_advantages = rewards - rewards.mean(dim=1, keepdim=True)
+        reward_std = rewards.std(dim=1, keepdim=True)
+        sliced_advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (
+            reward_std.clamp_min(STD_FLOOR)
+        )
         sliced_advantages = sliced_advantages.view(-1).to(device)
         chosen_token_log_probs = chosen_token_log_probs * generated_attention_mask
 
         valid_tokens = generated_attention_mask.sum(dim=-1).clamp_min(1)
-        log_prob_per_rollout = chosen_token_log_probs.sum(dim=-1) / valid_tokens
-        token_entropy = -log_prob_per_rollout.mean()
+        token_entropy = -(chosen_token_log_probs.sum(dim=-1) / valid_tokens).mean()
+
+        log_prob_per_rollout = chosen_token_log_probs.sum(dim=-1) / MAX_TOKENS
         policy_loss = -(log_prob_per_rollout * sliced_advantages).mean()
 
         sliced_frozen_token_log_probs = sliced_frozen_token_log_probs.view(
@@ -707,7 +713,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
     ar_optimizer.step()
     ar_scheduler.step()
     r = torch.cat(rewards).view(B, G)
-    r_std = r.std(dim=1).mean()
+    group_r_std = r.std(dim=1)
+    r_std = group_r_std.mean()
+    r_std_effective = group_r_std.clamp_min(STD_FLOOR).mean()
+    r_std_floor_fraction = (group_r_std < STD_FLOOR).float().mean()
     params0 = list(av_projectors.parameters()) + list(av_model.parameters())
     params1 = list(av_projectors_2.parameters()) + list(av_model_2.parameters())
     for p0, p1 in zip(params0, params1):
@@ -745,6 +754,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                 "train/av_lr": av_optimizer.param_groups[0]["lr"],
                 "train/ar_lr": ar_optimizer.param_groups[0]["lr"],
                 "train/r_std": r_std.item(),
+                "train/r_std_effective": r_std_effective.item(),
+                "train/r_std_floor_fraction": r_std_floor_fraction.item(),
                 "train/token_entropy": train_token_entropy.item(),
                 "train/avg_rollout_length": avg_rollout_length.item(),
                 "train/p95_rollout_length": p95_rollout_length.item(),
@@ -777,6 +788,10 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
             ar_optimizer.param_groups[0]["lr"],
             "train/r_std: ",
             r_std.item(),
+            "train/r_std_effective: ",
+            r_std_effective.item(),
+            "train/r_std_floor_fraction: ",
+            r_std_floor_fraction.item(),
             "train/token_entropy: ",
             train_token_entropy.item(),
             "train/avg_rollout_length: ",
@@ -932,7 +947,9 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     )
                     ar_test_loss += ar_loss_this_mini_batch.detach() / B
                     raw_reward = -mse_tensor - COSINE_WEIGHT * cos_loss
-                    r = raw_reward - raw_reward.mean()
+                    r = (raw_reward - raw_reward.mean()) / raw_reward.std().clamp_min(
+                        STD_FLOOR
+                    )
                     r = r.detach()
                     generated_av_outputs = av_outputs[
                         :, prompt_len - 1 : -1, :
@@ -956,9 +973,8 @@ for batch_idx, leela_activations in enumerate(tqdm(train_dataloader, smoothing=1
                     valid_tokens_per_rollout = generated_attention_mask.sum(
                         dim=-1
                     ).clamp_min(1)
-                    policy_loss = -(
-                        clipped_obj.sum(dim=-1) / valid_tokens_per_rollout
-                    ).mean()
+
+                    policy_loss = -(clipped_obj.sum(dim=-1) / MAX_TOKENS).mean()
 
                     frozen_hidden_states = frozen_model_outputs.last_hidden_state[
                         :, prompt_len - 1 : -1, :
